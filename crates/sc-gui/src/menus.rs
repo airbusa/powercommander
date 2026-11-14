@@ -247,11 +247,12 @@ fn items(list: &[Item], chosen: Appearance, checked: &dyn Fn(Command) -> bool) -
             Some(MenuItem::submenu(Menu::new(label).items(each)))
         }
         Item::ClosedTabs { .. } => None,
-        Item::Workspaces { label } => {
+        Item::Workspaces { label, items: rest } => {
             let (names, current) = WORKSPACES.lock().unwrap_or_else(|err| err.into_inner()).clone();
             let each = names.into_iter().enumerate();
             let each = each.map(|(ix, name)| item(name.into(), current == ix, Box::new(OpenWorkspace(ix)), false));
-            Some(MenuItem::submenu(Menu::new(label).items(each)))
+            let all = each.chain(items(rest, chosen, checked));
+            Some(MenuItem::submenu(Menu::new(label).items(all)))
         }
     });
     // What the application menu took may leave a separator last.

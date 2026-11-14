@@ -180,9 +180,10 @@ pub enum Item {
     ClosedTabs {
         label: &'static str,
     },
-    /// A submenu of the workspaces, to open one.
+    /// A submenu of the workspaces, to open one, then `items`.
     Workspaces {
         label: &'static str,
+        items: &'static [Item],
     },
     Separator,
 }
@@ -312,11 +313,6 @@ pub const MENUS: &[Menu] = &[
             cmd("Bookmarks", Bookmarks),
             cmd("Bookmark This Folder", BookmarkFolder),
             cmd("Manage Bookmarks...", ManageBookmarks),
-            SEP,
-            Item::Workspaces { label: "Workspaces" },
-            cmd("New Workspace...", NewWorkspace),
-            cmd("Duplicate Workspace...", DuplicateWorkspace),
-            cmd("Manage Workspaces...", ManageWorkspaces),
         ],
     },
     Menu {
@@ -398,6 +394,16 @@ pub const MENUS: &[Menu] = &[
                     cmd("Next Tab", NextTab),
                     cmd("Previous Tab", PreviousTab),
                     cmd("List of Tabs", ListTabs),
+                ],
+            },
+            // Krusader's Profiles are in its Window menu: what is shown, not where.
+            Item::Workspaces {
+                label: "Workspaces",
+                items: &[
+                    SEP,
+                    cmd("New Workspace...", NewWorkspace),
+                    cmd("Duplicate Workspace...", DuplicateWorkspace),
+                    cmd("Manage Workspaces...", ManageWorkspaces),
                 ],
             },
             SEP,
@@ -494,7 +500,7 @@ pub fn groups() -> Vec<(&'static str, Vec<(&'static str, Command)>)> {
                     let full = FULL_NAMES.iter().find(|(c, _)| *c == command);
                     out.push((full.map_or(label.trim_end_matches("..."), |(_, name)| name), command));
                 }
-                Item::Submenu { items, .. } => walk(items, seen, out),
+                Item::Submenu { items, .. } | Item::Workspaces { items, .. } => walk(items, seen, out),
                 _ => {}
             }
         }
