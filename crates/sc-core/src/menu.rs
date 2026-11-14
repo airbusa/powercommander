@@ -61,9 +61,11 @@ pub enum Command {
     BookmarkFolder,
     /// Bookmarks to add, remove, rename and put in order.
     ManageBookmarks,
-    /// The open tabs under a name, as a workspace to come back to.
+    /// A workspace of the home folder's tabs, opened.
     NewWorkspace,
-    /// Workspaces to rename and delete.
+    /// A copy of the open workspace, opened.
+    DuplicateWorkspace,
+    /// Workspaces to make, copy, rename and delete.
     ManageWorkspaces,
     GoBack,
     GoForward,
@@ -313,6 +315,7 @@ pub const MENUS: &[Menu] = &[
             SEP,
             Item::Workspaces { label: "Workspaces" },
             cmd("New Workspace...", NewWorkspace),
+            cmd("Duplicate Workspace...", DuplicateWorkspace),
             cmd("Manage Workspaces...", ManageWorkspaces),
         ],
     },

@@ -1,5 +1,5 @@
 //! Go > Workspaces: named sets of both panels' tabs and the terminal's. What
-//! changes goes into the open one; there is nothing to save.
+//! changes goes into the open one; there is nothing to save. There is always one.
 
 use std::mem;
 
@@ -23,7 +23,7 @@ pub(crate) struct Parked {
     terminal_shown: bool,
 }
 
-/// The one opened in place of the deleted open one.
+/// The one opened in place of the open one deleted.
 fn neighbour(ix: usize) -> usize {
     if ix == 0 { 1 } else { ix - 1 }
 }
@@ -50,30 +50,51 @@ impl Commander {
         cx.notify();
     }
 
-    /// Go > New Workspace: the open tabs go on under a name; the workspace
-    /// left keeps them as they are now.
+    /// Go > New Workspace: one tab of the home folder on each side, opened.
     pub(crate) fn new_workspace(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let free = (1..).map(|n| format!("Workspace {n}")).find(|name| self.workspaces.name_error(name, None).is_none());
         let commander = cx.entity().downgrade();
         name_dialog::open("New Workspace", "Name:", free.unwrap_or_default(), window, cx, move |name, window, cx| {
             let _ = commander.update(cx, |this, cx| {
-                if let Some(problem) = this.workspaces.name_error(&name, None) {
-                    return window.push_notification(Notification::error(problem), cx);
-                }
-                if let Some(current) = this.workspaces.current {
-                    this.workspaces.list[current].open = this.open_tabs();
-                }
-                this.workspaces.add(&name, this.open_tabs());
-                this.parked.push(None);
-                this.workspaces_changed(window, cx);
+                let at = this.workspaces.list.len();
+                this.add_workspace(at, name, OpenTabs::default(), window, cx)
             });
         });
+    }
+
+    /// Go > Duplicate Workspace: a copy of workspace `ix` beside it, opened.
+    pub(crate) fn duplicate_workspace(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(workspace) = self.workspaces.list.get(ix) else {
+            return;
+        };
+        let name = self.workspaces.free_name(&format!("{} copy", workspace.name));
+        let commander = cx.entity().downgrade();
+        name_dialog::open("Duplicate Workspace", "Name:", name, window, cx, move |name, window, cx| {
+            let _ = commander.update(cx, |this, cx| {
+                // The open one as it is now; its shells start again in their folders.
+                let open = match this.workspaces.current == ix {
+                    true => this.open_tabs(),
+                    false => this.workspaces.list[ix].open.clone(),
+                };
+                this.add_workspace(ix + 1, name, open, window, cx)
+            });
+        });
+    }
+
+    fn add_workspace(&mut self, at: usize, name: String, open: OpenTabs, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(problem) = self.workspaces.name_error(&name, None) {
+            return window.push_notification(Notification::error(problem), cx);
+        }
+        let at = at.min(self.workspaces.list.len());
+        self.workspaces.insert(at, &name, open);
+        self.parked.insert(at, None);
+        self.open_workspace(at, window, cx);
     }
 
     /// Go > Workspaces > one: the open tabs and shells put aside as they are,
     /// its own back as they were left, or as saved.
     pub(crate) fn open_workspace(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
-        if ix >= self.workspaces.list.len() || self.workspaces.current == Some(ix) {
+        if ix >= self.workspaces.list.len() || self.workspaces.current == ix {
             return;
         }
         let fresh = self.parked[ix].is_none();
@@ -96,11 +117,10 @@ impl Commander {
             terminal_tab: mem::replace(&mut self.terminal_tab, terminal_tab),
             terminal_shown: mem::replace(&mut self.terminal_shown, terminal_shown),
         };
-        if let Some(current) = self.workspaces.current {
-            self.workspaces.list[current].open = left_open;
-            self.parked[current] = Some(left);
-        }
-        self.workspaces.current = Some(ix);
+        let current = self.workspaces.current;
+        self.workspaces.list[current].open = left_open;
+        self.parked[current] = Some(left);
+        self.workspaces.current = ix;
         self.switches += 1;
         (self.typing, self.path_edit, self.renaming, self.panel_list) = (None, None, None, None);
         for side in &self.panels {
@@ -139,28 +159,22 @@ impl Commander {
 
     /// Asked first: its shells end with it.
     fn confirm_delete_workspace(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(workspace) = self.workspaces.list.get(ix) else {
+        let Some(workspace) = self.workspaces.list.get(ix).filter(|_| self.workspaces.list.len() > 1) else {
             return;
         };
-        let open = self.workspaces.current == Some(ix);
+        let open = self.workspaces.current == ix;
         let shells = match open {
             true => self.terminals.len(),
             false => self.parked[ix].as_ref().map_or(0, |parked| parked.terminals.len()),
         };
         let mut text = format!("Delete the workspace \"{}\"? ", workspace.name);
-        text += match (open, self.workspaces.list.len()) {
-            (true, 1) => "Its tabs stay open, as no workspace's.",
-            (true, _) => "Its tabs close",
-            (false, _) => "Its tabs are forgotten",
-        };
-        if !(open && self.workspaces.list.len() == 1) {
-            if shells > 0 {
-                text += ", and the shells in its terminal tabs end";
-            }
-            match open {
-                true => text += &format!("; \"{}\" opens instead.", self.workspaces.list[neighbour(ix)].name),
-                false => text += ".",
-            }
+        text += if open { "Its tabs close" } else { "Its tabs are forgotten" };
+        if shells > 0 {
+            text += ", and the shells in its terminal tabs end";
+        }
+        match open {
+            true => text += &format!("; \"{}\" opens instead.", self.workspaces.list[neighbour(ix)].name),
+            false => text += ".",
         }
         let commander = cx.entity().downgrade();
         window.open_alert_dialog(cx, move |alert, _, _| {
@@ -172,16 +186,17 @@ impl Commander {
         });
     }
 
-    /// The open one: another opens first, unless it is the last, whose tabs stay.
+    /// Any but the last; the open one, another opens first.
     fn delete_workspace(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
-        if ix >= self.workspaces.list.len() {
+        if ix >= self.workspaces.list.len() || self.workspaces.list.len() < 2 {
             return;
         }
-        if self.workspaces.current == Some(ix) && self.workspaces.list.len() > 1 {
+        if self.workspaces.current == ix {
             self.open_workspace(neighbour(ix), window, cx);
         }
-        self.workspaces.remove(ix);
-        self.parked.remove(ix);
+        if self.workspaces.remove(ix) {
+            self.parked.remove(ix);
+        }
         self.workspaces_changed(window, cx);
     }
 
@@ -190,7 +205,8 @@ impl Commander {
         let view = cx.new(|cx| WorkspacesDialog {
             _changed: cx.observe(&commander, |_, _, cx| cx.notify()),
             commander: commander.downgrade(),
-            selected: self.workspaces.current,
+            selected: Some(self.workspaces.current),
+            shown_open: self.workspaces.current,
         });
         window.open_dialog(cx, move |dialog, _, _| dialog.title("Workspaces").width(px(560.)).child(view.clone()));
     }
@@ -213,6 +229,8 @@ fn summary(open: &OpenTabs) -> String {
 struct WorkspacesDialog {
     commander: WeakEntity<Commander>,
     selected: Option<usize>,
+    /// The open one at the last look: one made or opened here gets selected.
+    shown_open: usize,
     _changed: Subscription,
 }
 
@@ -223,26 +241,26 @@ impl Render for WorkspacesDialog {
         };
         let this = commander.read(cx);
         let current = this.workspaces.current;
+        if current != self.shown_open {
+            (self.selected, self.shown_open) = (Some(current), current);
+        }
         let rows: Vec<(String, String)> = (this.workspaces.list.iter().enumerate())
             .map(|(ix, workspace)| {
                 // The open one's as it is now.
-                let text = match current == Some(ix) {
+                let text = match current == ix {
                     true => summary(&this.open_tabs()),
                     false => summary(&workspace.open),
                 };
                 (workspace.name.clone(), text)
             })
             .collect();
-        let selected = self.selected.filter(|&ix| ix < rows.len());
+        let (selected, rows_count) = (self.selected.filter(|&ix| ix < rows.len()), rows.len());
         let theme = cx.theme();
         let muted = theme.muted_foreground;
         let mut list = v_flex().id("workspace-list").h(px(240.)).overflow_y_scroll().p_1().border_1().border_color(theme.border).rounded(theme.radius);
-        if rows.is_empty() {
-            list = list.child(div().p_2().text_sm().text_color(muted).child("No workspaces: Go > New Workspace names the open tabs."));
-        }
         for (ix, (name, text)) in rows.into_iter().enumerate() {
             let theme = cx.theme();
-            let open = current == Some(ix);
+            let open = current == ix;
             let faint = if selected == Some(ix) { theme.foreground.opacity(0.7) } else { muted };
             list = list.child(
                 v_flex()
@@ -269,10 +287,15 @@ impl Render for WorkspacesDialog {
                 }
             }))
         };
+        let count = rows_count;
         let buttons = h_flex()
             .gap_2()
+            .child(Button::new("workspaces-new").outline().label("New...").on_click(cx.listener(|this, _, window, cx| {
+                let _ = this.commander.update(cx, |commander, cx| commander.new_workspace(window, cx));
+            })))
+            .child(on_selected(Button::new("workspaces-duplicate").label("Duplicate..."), Commander::duplicate_workspace))
             .child(on_selected(Button::new("workspaces-rename").label("Rename..."), Commander::rename_workspace))
-            .child(on_selected(Button::new("workspaces-delete").label("Delete..."), Commander::confirm_delete_workspace))
+            .child(on_selected(Button::new("workspaces-delete").label("Delete..."), Commander::confirm_delete_workspace).disabled(selected.is_none() || count < 2))
             .child(div().flex_1())
             .child(Button::new("workspaces-close").primary().label("Close").min_w(px(80.)).on_click(|_, window, cx| window.close_dialog(cx)));
         v_flex()

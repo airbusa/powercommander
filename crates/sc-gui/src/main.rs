@@ -886,10 +886,9 @@ impl Commander {
     // shortcut: a failed save on quit goes unreported; there is no window left to say it.
     fn save_session(&mut self) {
         let _ = self.session().save();
-        if let Some(current) = self.workspaces.current {
-            self.workspaces.list[current].open = self.open_tabs();
-            let _ = self.workspaces.save();
-        }
+        let current = self.workspaces.current;
+        self.workspaces.list[current].open = self.open_tabs();
+        let _ = self.workspaces.save();
     }
 
     /// F3 views, F4 edits the file under the cursor.
@@ -2366,6 +2365,7 @@ impl Render for Commander {
                     Command::BookmarkFolder => this.bookmark_folder(window, cx),
                     Command::ManageBookmarks => this.manage_bookmarks(window, cx),
                     Command::NewWorkspace => this.new_workspace(window, cx),
+                    Command::DuplicateWorkspace => this.duplicate_workspace(this.workspaces.current, window, cx),
                     Command::ManageWorkspaces => this.manage_workspaces(window, cx),
                     Command::ToggleSidebar => {
                         let tab = this.sidebar.tab.unwrap_or(this.sidebar.last);

@@ -197,7 +197,7 @@ pub fn last_filter() -> String {
 }
 
 /// Go > Workspaces' names, and which is open.
-static WORKSPACES: std::sync::Mutex<(Vec<String>, Option<usize>)> = std::sync::Mutex::new((Vec::new(), None));
+static WORKSPACES: std::sync::Mutex<(Vec<String>, usize)> = std::sync::Mutex::new((Vec::new(), 0));
 
 /// Call `set` after.
 pub fn set_workspaces(workspaces: &sc_core::session::Workspaces) {
@@ -249,14 +249,8 @@ fn items(list: &[Item], chosen: Appearance, checked: &dyn Fn(Command) -> bool) -
         Item::ClosedTabs { .. } => None,
         Item::Workspaces { label } => {
             let (names, current) = WORKSPACES.lock().unwrap_or_else(|err| err.into_inner()).clone();
-            let mut each: Vec<MenuItem> = names
-                .into_iter()
-                .enumerate()
-                .map(|(ix, name)| item(name.into(), current == Some(ix), Box::new(OpenWorkspace(ix)), false))
-                .collect();
-            if each.is_empty() {
-                each.push(item("(none)".into(), false, Box::new(Unavailable), true));
-            }
+            let each = names.into_iter().enumerate();
+            let each = each.map(|(ix, name)| item(name.into(), current == ix, Box::new(OpenWorkspace(ix)), false));
             Some(MenuItem::submenu(Menu::new(label).items(each)))
         }
     });

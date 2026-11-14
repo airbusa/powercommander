@@ -26,7 +26,7 @@ pub struct Session {
 }
 
 /// Both panels' tabs and the terminal's: what a workspace keeps.
-#[derive(Default, Serialize, Deserialize)]
+#[derive(Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct OpenTabs {
     pub sides: Vec<SideState>,
@@ -39,14 +39,14 @@ pub struct OpenTabs {
     pub terminal_tab: usize,
 }
 
-#[derive(Default, Serialize, Deserialize)]
+#[derive(Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct SideState {
     pub tabs: Vec<TabState>,
     pub active: usize,
 }
 
-#[derive(Default, Serialize, Deserialize)]
+#[derive(Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct TabState {
     /// The folder, or the archive.
@@ -95,12 +95,20 @@ impl Session {
 }
 
 /// Go > Workspaces: named sets of open tabs; changes go to the open one.
-#[derive(Default, Serialize, Deserialize)]
+/// There is always one.
+#[derive(Serialize, Deserialize)]
 #[serde(default)]
 pub struct Workspaces {
     pub list: Vec<Workspace>,
-    /// The open one; none before the first is made.
-    pub current: Option<usize>,
+    /// The open one.
+    pub current: usize,
+}
+
+impl Default for Workspaces {
+    fn default() -> Self {
+        let first = Workspace { name: "Workspace 1".into(), open: OpenTabs::default() };
+        Self { list: vec![first], current: 0 }
+    }
 }
 
 #[derive(Default, Serialize, Deserialize)]
@@ -114,7 +122,10 @@ pub struct Workspace {
 impl Workspaces {
     pub fn load() -> io::Result<Self> {
         let mut workspaces: Self = settings::read_json(WORKSPACES)?;
-        workspaces.current = workspaces.current.filter(|&ix| ix < workspaces.list.len());
+        if workspaces.list.is_empty() {
+            workspaces = Self::default();
+        }
+        workspaces.current = workspaces.current.min(workspaces.list.len() - 1);
         Ok(workspaces)
     }
 
@@ -131,23 +142,31 @@ impl Workspaces {
         taken.then_some("Another workspace has this name.")
     }
 
-    /// The open tabs kept as a new workspace, which becomes the open one.
-    pub fn add(&mut self, name: &str, open: OpenTabs) {
-        self.list.push(Workspace { name: name.trim().to_owned(), open });
-        self.current = Some(self.list.len() - 1);
+    /// `base`, or with the first number that makes it a free name.
+    pub fn free_name(&self, base: &str) -> String {
+        let names = std::iter::once(base.to_owned()).chain((2..).map(|n| format!("{base} {n}")));
+        names.into_iter().find(|name| self.name_error(name, None).is_none()).unwrap_or_default()
     }
 
-    /// Gone; the open one gone, none is open.
-    pub fn remove(&mut self, ix: usize) {
-        if ix >= self.list.len() {
-            return;
+    /// A new workspace at `at`; the open one stays open.
+    pub fn insert(&mut self, at: usize, name: &str, open: OpenTabs) {
+        let at = at.min(self.list.len());
+        self.list.insert(at, Workspace { name: name.trim().to_owned(), open });
+        if self.current >= at {
+            self.current += 1;
+        }
+    }
+
+    /// Gone, unless it is the last or the open one: open another first.
+    pub fn remove(&mut self, ix: usize) -> bool {
+        if self.list.len() < 2 || ix >= self.list.len() || ix == self.current {
+            return false;
         }
         self.list.remove(ix);
-        self.current = match self.current {
-            Some(current) if current == ix => None,
-            Some(current) if current > ix => Some(current - 1),
-            current => current,
-        };
+        if self.current > ix {
+            self.current -= 1;
+        }
+        true
     }
 }
 
@@ -156,20 +175,20 @@ mod tests {
     use super::*;
 
     #[test]
-    fn workspaces_are_named_once_and_removed_in_place() {
+    fn there_is_always_a_workspace_and_names_are_once() {
         let mut workspaces = Workspaces::default();
-        workspaces.add(" Site ", OpenTabs::default());
-        workspaces.add("Book", OpenTabs::default());
-        assert_eq!(workspaces.list[0].name, "Site");
-        assert_eq!(workspaces.current, Some(1));
+        assert_eq!((workspaces.list.len(), workspaces.current), (1, 0));
+        assert!(!workspaces.remove(0));
+        workspaces.insert(0, " Site ", OpenTabs::default());
+        assert_eq!((workspaces.list[0].name.as_str(), workspaces.current), ("Site", 1));
         assert!(workspaces.name_error("site", None).is_none());
         assert!(workspaces.name_error("Site ", None).is_some());
         assert!(workspaces.name_error("Site", Some(0)).is_none());
         assert!(workspaces.name_error("  ", Some(0)).is_some());
-        workspaces.remove(0);
-        assert_eq!(workspaces.current, Some(0));
-        workspaces.remove(0);
-        assert_eq!(workspaces.current, None);
+        assert_eq!(workspaces.free_name("Site"), "Site 2");
+        assert!(!workspaces.remove(1));
+        assert!(workspaces.remove(0));
+        assert_eq!((workspaces.list.len(), workspaces.current), (1, 0));
     }
 
     #[test]
