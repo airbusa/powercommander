@@ -47,6 +47,7 @@ mod terminal_pane;
 mod transfer;
 mod viewer;
 mod views;
+mod workspaces;
 
 use std::borrow::Cow;
 use std::cell::Cell;
@@ -69,7 +70,7 @@ use gpui_kit::*;
 use sc_core::command::{self, Outcome};
 use sc_core::menu::{BUTTON_BAR, Command, Item, TAB_MENU};
 use sc_core::remote::Address;
-use sc_core::session::Session;
+use sc_core::session::{Session, SideState, Workspaces};
 use sc_core::settings::{self, Settings};
 use sc_core::sidebar::SidebarTab;
 use sc_core::theme::{self, Appearance};
@@ -77,7 +78,7 @@ use sc_core::{FileFilter, Panel, Sort, SortKey, Tabs, Typed, View, archive, edit
 
 use crate::appearance::PanelColors;
 use crate::drag_drop::{DragLabel, Dragged};
-use crate::menus::{GoToHistory, ReopenTab, Run, SelectTab, SetAppearance};
+use crate::menus::{GoToHistory, OpenWorkspace, ReopenTab, Run, SelectTab, SetAppearance};
 
 actions!(
     sc,
@@ -509,6 +510,11 @@ struct Commander {
     vertical: bool,
     /// Synchronized browsing: the other panel makes the active one's moves too.
     sync_browsing: bool,
+    workspaces: Workspaces,
+    /// The workspaces left this run, by their place in the list: as they were, shells running.
+    parked: Vec<Option<workspaces::Parked>>,
+    /// Workspaces opened this run: a server's late answer for one left is dropped.
+    switches: u64,
     /// The built-in terminal's shells and the one shown; shown or not, and its height.
     terminals: Vec<terminal_pane::TerminalTab>,
     terminal_tab: usize,
@@ -548,6 +554,11 @@ impl Commander {
             problems.push(format!("Could not read the open tabs: {err}"));
             Session::default()
         });
+        let workspaces = Workspaces::load().unwrap_or_else(|err| {
+            problems.push(format!("Could not read the workspaces: {err}"));
+            Workspaces::default()
+        });
+        menus::set_workspaces(&workspaces);
         if !problems.is_empty() {
             // Notifications need the window's root first.
             window.defer(cx, move |window, cx| {
@@ -571,18 +582,8 @@ impl Commander {
                 this.colors = appearance::apply(&palette(&this.settings, window), cx);
             }
         });
-        let home = std::env::home_dir().unwrap_or_else(|| "/".into());
-        let filter = settings.filter();
-        let fallback = || {
-            Panel::new(&home, filter)
-                .or_else(|_| Panel::new("/", filter))
-                .expect("list the home folder or /")
-        };
         let side = |ix: usize| Side {
-            tabs: match session.sides.get(ix) {
-                Some(state) => Tabs::restore(state, filter, fallback),
-                None => Tabs::new(fallback()),
-            },
+            tabs: restore_side(session.open.sides.get(ix), settings.filter()),
             scroll: UniformListScrollHandle::new(),
             brief: ScrollHandle::new(),
             area: Rc::default(),
@@ -595,7 +596,7 @@ impl Commander {
         });
         let this = cx.weak_entity();
         window.on_window_should_close(cx, move |_, cx| {
-            let _ = this.read_with(cx, |this, _| {
+            let _ = this.update(cx, |this, _| {
                 this.save_session();
                 this.transfers.queue.stop_all();
             });
@@ -620,18 +621,20 @@ impl Commander {
         let focus = cx.focus_handle();
         window.focus(&focus, cx);
         // The window's root, which paints its background, comes after this.
-        let terminal = session.terminal;
+        let (shown, terminals, terminal_tab) = (session.open.terminal, session.open.terminals.clone(), session.open.terminal_tab);
         cx.defer_in(window, move |this, window, cx| {
             this.set_backdrop(window, cx);
-            // Open again, the panels keeping the keys: after the terminal takes them.
-            if terminal {
+            // Saved before its tabs were: a shell, the panels keeping the keys after the terminal takes them.
+            if shown && terminals.is_empty() {
                 this.toggle_terminal(window, cx);
                 cx.defer_in(window, |this, window, cx| window.focus(&this.focus, cx));
+            } else {
+                this.open_terminals(&terminals, terminal_tab, shown, window, cx);
             }
         });
         Self {
             panels: [side(0), side(1)],
-            active: session.active.min(1),
+            active: session.open.active.min(1),
             // Name 0: it filled the panel once.
             columns: match session.columns[..] {
                 [name, ext, size, date, attr] if name > 0. => [name, ext, size, date, attr],
@@ -667,6 +670,9 @@ impl Commander {
             app_icons: app_icons::AppIcons::default(),
             vertical: session.vertical,
             sync_browsing: false,
+            parked: workspaces.list.iter().map(|_| None).collect(),
+            workspaces,
+            switches: 0,
             terminals: Vec::new(),
             terminal_tab: 0,
             terminal_shown: false,
@@ -878,8 +884,12 @@ impl Commander {
     }
 
     // shortcut: a failed save on quit goes unreported; there is no window left to say it.
-    fn save_session(&self) {
+    fn save_session(&mut self) {
         let _ = self.session().save();
+        if let Some(current) = self.workspaces.current {
+            self.workspaces.list[current].open = self.open_tabs();
+            let _ = self.workspaces.save();
+        }
     }
 
     /// F3 views, F4 edits the file under the cursor.
@@ -1408,15 +1418,13 @@ impl Commander {
 
     fn session(&self) -> Session {
         Session {
-            sides: self.panels.iter().map(|side| side.tabs.state()).collect(),
-            active: self.active,
+            open: self.open_tabs(),
             columns: self.columns.to_vec(),
             split: self.split,
             sidebar: self.sidebar.tab,
             sidebar_width: self.sidebar.width,
             vertical: self.vertical,
             terminal_height: self.terminal_height,
-            terminal: self.terminal_shown,
         }
     }
 
@@ -1658,7 +1666,7 @@ impl Commander {
             self.panels[ix].scroll_to_cursor();
             return cx.notify();
         }
-        let tab = side.tabs.active();
+        let (tab, switches) = (side.tabs.active(), self.switches);
         let mut moved = side.tabs.current().clone();
         cx.spawn_in(window, async move |this, cx| {
             let went = cx
@@ -1666,6 +1674,9 @@ impl Commander {
                 .spawn(async move { go(&mut moved).map(|()| moved) });
             let went = went.await;
             let _ = this.update_in(cx, |this, window, cx| {
+                if this.switches != switches {
+                    return;
+                }
                 match went {
                     Ok(moved) => {
                         this.panels[ix].tabs.navigated(tab, moved);
@@ -2354,6 +2365,8 @@ impl Render for Commander {
                     Command::Bookmarks => this.show_bookmarks(window, cx),
                     Command::BookmarkFolder => this.bookmark_folder(window, cx),
                     Command::ManageBookmarks => this.manage_bookmarks(window, cx),
+                    Command::NewWorkspace => this.new_workspace(window, cx),
+                    Command::ManageWorkspaces => this.manage_workspaces(window, cx),
                     Command::ToggleSidebar => {
                         let tab = this.sidebar.tab.unwrap_or(this.sidebar.last);
                         this.toggle_sidebar(tab, window, cx)
@@ -2456,6 +2469,9 @@ impl Render for Commander {
             }))
             .on_action(cx.listener(|this, ReopenTab(ix): &ReopenTab, window, cx| {
                 this.reopen_tab(*ix, window, cx)
+            }))
+            .on_action(cx.listener(|this, OpenWorkspace(ix): &OpenWorkspace, window, cx| {
+                this.open_workspace(*ix, window, cx)
             }))
             .on_action(cx.listener(|this, SetAppearance(chosen): &SetAppearance, window, cx| {
                 this.set_appearance(*chosen, window, cx)
@@ -2615,6 +2631,18 @@ pub(crate) fn window_icon() -> Option<std::sync::Arc<image::RgbaImage>> {
 
 /// The system's look, light or dark as chosen; on Xfce, MATE and Cinnamon
 /// always their theme's, which GTK draws only as it is.
+/// A side's tabs as saved; without them, the home folder's (or /).
+fn restore_side(state: Option<&SideState>, filter: sc_core::Filter) -> Tabs {
+    let fallback = || {
+        let home = std::env::home_dir().unwrap_or_else(|| "/".into());
+        Panel::new(&home, filter).or_else(|_| Panel::new("/", filter)).expect("list the home folder or /")
+    };
+    match state {
+        Some(state) => Tabs::restore(state, filter, fallback),
+        None => Tabs::new(fallback()),
+    }
+}
+
 fn palette(settings: &Settings, window: &Window) -> theme::Palette {
     #[cfg(target_os = "macos")]
     appearance::mac_force(settings.appearance);

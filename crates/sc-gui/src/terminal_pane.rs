@@ -9,6 +9,7 @@ use gpui_kit::component::tab::{Tab, TabBar};
 use gpui_kit::component::{ActiveTheme, Sizable, WindowExt, v_flex};
 use gpui_kit::*;
 use sc_core::menu::Command;
+use sc_core::session::TerminalState;
 
 use crate::Commander;
 use crate::menus::Run;
@@ -19,7 +20,15 @@ pub(crate) struct TerminalTab {
     pub(crate) view: Entity<TerminalView>,
     /// The shell's folder, as sent to it or seen; none for an ssh session.
     pub(crate) dir: Option<PathBuf>,
+    /// What runs instead of the shell: ssh.
+    program: Option<(String, Vec<String>)>,
     _ended: Subscription,
+}
+
+impl TerminalTab {
+    pub(crate) fn state(&self) -> TerminalState {
+        TerminalState { dir: self.dir.clone(), program: self.program.clone() }
+    }
 }
 
 /// The terminal's top edge, dragged.
@@ -36,7 +45,7 @@ impl Commander {
     }
 
     /// Shown or hidden: the backdrop, and the menus' check on Show > Terminal.
-    fn terminal_changed(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn terminal_changed(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.set_backdrop(window, cx);
         self.reload_menus(cx);
         cx.notify();
@@ -78,7 +87,7 @@ impl Commander {
     /// A shell in `dir` (else home), or `program` there.
     fn open_terminal_tab(&mut self, dir: Option<PathBuf>, program: Option<(String, Vec<String>)>, window: &mut Window, cx: &mut Context<Self>) {
         let home = std::env::home_dir().unwrap_or_default();
-        match TerminalView::open(dir.as_deref().unwrap_or(&home), program, window, cx) {
+        match TerminalView::open(dir.as_deref().unwrap_or(&home), program.clone(), window, cx) {
             Ok(view) => {
                 let ended = cx.subscribe_in(&view, window, |this, view, _: &Exited, window, cx| {
                     if let Some(ix) = this.terminals.iter().position(|tab| &tab.view == view) {
@@ -86,12 +95,25 @@ impl Commander {
                     }
                 });
                 self.focus_later(view.read(cx).focus.clone(), window, cx);
-                self.terminals.push(TerminalTab { view, dir, _ended: ended });
+                self.terminals.push(TerminalTab { view, dir, program, _ended: ended });
                 self.terminal_tab = self.terminals.len() - 1;
                 self.terminal_shown = true;
             }
             Err(err) => window.push_notification(Notification::error(format!("Could not start the shell: {err}")), cx),
         }
+        self.terminal_changed(window, cx);
+    }
+
+    /// Saved tabs started again, shown or hidden as they were; the panels keep the keys.
+    pub(crate) fn open_terminals(&mut self, saved: &[TerminalState], tab: usize, shown: bool, window: &mut Window, cx: &mut Context<Self>) {
+        for state in saved {
+            // A folder gone since: home's.
+            let dir = state.program.is_none().then(|| state.dir.clone().filter(|dir| dir.is_dir()).or_else(std::env::home_dir)).flatten();
+            self.open_terminal_tab(dir, state.program.clone(), window, cx);
+        }
+        self.terminal_tab = tab.min(self.terminals.len().saturating_sub(1));
+        self.terminal_shown = shown && !self.terminals.is_empty();
+        self.focus_later(self.focus.clone(), window, cx);
         self.terminal_changed(window, cx);
     }
 

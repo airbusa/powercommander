@@ -154,7 +154,7 @@ impl App {
                 .expect("list the home folder or /")
         };
         let side = |ix: usize| Side {
-            tabs: match session.sides.get(ix) {
+            tabs: match session.open.sides.get(ix) {
                 Some(state) => Tabs::restore(state, filter, fallback),
                 None => Tabs::new(fallback()),
             },
@@ -165,7 +165,7 @@ impl App {
             .collect();
         let mut app = App {
             sides: [side(0), side(1)],
-            active: session.active.min(1),
+            active: session.open.active.min(1),
             settings,
             command: Input::default(),
             message: None,
@@ -249,11 +249,12 @@ impl App {
     }
 
     fn save_session(&self) {
-        let session = Session {
+        let open = session::OpenTabs {
             sides: self.sides.iter().map(|side| side.tabs.state()).collect(),
             active: self.active,
-            ..Session::default()
+            ..Default::default()
         };
+        let session = Session { open, ..Session::default() };
         if let Err(err) = session.save_to(session::TERMINAL) {
             eprintln!("Could not save the open tabs: {err}");
         }

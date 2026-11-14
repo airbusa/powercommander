@@ -61,6 +61,10 @@ pub enum Command {
     BookmarkFolder,
     /// Bookmarks to add, remove, rename and put in order.
     ManageBookmarks,
+    /// The open tabs under a name, as a workspace to come back to.
+    NewWorkspace,
+    /// Workspaces to rename and delete.
+    ManageWorkspaces,
     GoBack,
     GoForward,
     /// Alt+Down: the tab's last places, to pick one.
@@ -172,6 +176,10 @@ pub enum Item {
     },
     /// A submenu of the side's recently closed tabs.
     ClosedTabs {
+        label: &'static str,
+    },
+    /// A submenu of the workspaces, to open one.
+    Workspaces {
         label: &'static str,
     },
     Separator,
@@ -302,6 +310,10 @@ pub const MENUS: &[Menu] = &[
             cmd("Bookmarks", Bookmarks),
             cmd("Bookmark This Folder", BookmarkFolder),
             cmd("Manage Bookmarks...", ManageBookmarks),
+            SEP,
+            Item::Workspaces { label: "Workspaces" },
+            cmd("New Workspace...", NewWorkspace),
+            cmd("Manage Workspaces...", ManageWorkspaces),
         ],
     },
     Menu {

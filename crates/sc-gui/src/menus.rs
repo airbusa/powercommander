@@ -36,6 +36,11 @@ pub struct GoToHistory(pub usize);
 #[action(namespace = sc, no_json)]
 pub struct ReopenTab(pub usize);
 
+/// Go > Workspaces: one, by its place in the list.
+#[derive(Action, Clone, PartialEq)]
+#[action(namespace = sc, no_json)]
+pub struct OpenWorkspace(pub usize);
+
 /// macOS greys out a menu item only when no one handles its action.
 #[derive(Action, Clone, PartialEq)]
 #[action(namespace = sc, no_json)]
@@ -191,6 +196,15 @@ pub fn last_filter() -> String {
     if masks.is_empty() { "*.*".to_owned() } else { masks }
 }
 
+/// Go > Workspaces' names, and which is open.
+static WORKSPACES: std::sync::Mutex<(Vec<String>, Option<usize>)> = std::sync::Mutex::new((Vec::new(), None));
+
+/// Call `set` after.
+pub fn set_workspaces(workspaces: &sc_core::session::Workspaces) {
+    let names = workspaces.list.iter().map(|workspace| workspace.name.clone()).collect();
+    *WORKSPACES.lock().unwrap_or_else(|err| err.into_inner()) = (names, workspaces.current);
+}
+
 /// Call `AppMenuBar::reload` after.
 /// The menu bar; `checked` commands show a check mark.
 pub fn set(chosen: Appearance, checked: &dyn Fn(Command) -> bool, cx: &mut App) {
@@ -233,6 +247,18 @@ fn items(list: &[Item], chosen: Appearance, checked: &dyn Fn(Command) -> bool) -
             Some(MenuItem::submenu(Menu::new(label).items(each)))
         }
         Item::ClosedTabs { .. } => None,
+        Item::Workspaces { label } => {
+            let (names, current) = WORKSPACES.lock().unwrap_or_else(|err| err.into_inner()).clone();
+            let mut each: Vec<MenuItem> = names
+                .into_iter()
+                .enumerate()
+                .map(|(ix, name)| item(name.into(), current == Some(ix), Box::new(OpenWorkspace(ix)), false))
+                .collect();
+            if each.is_empty() {
+                each.push(item("(none)".into(), false, Box::new(Unavailable), true));
+            }
+            Some(MenuItem::submenu(Menu::new(label).items(each)))
+        }
     });
     // What the application menu took may leave a separator last.
     let mut items: Vec<MenuItem> = all.collect();
@@ -382,7 +408,7 @@ pub fn context_menu(
                 })
             }
             // shortcut: no submenus or appearances in context menus yet; add them when one has them.
-            Item::Submenu { .. } | Item::Appearance { .. } => menu,
+            Item::Submenu { .. } | Item::Appearance { .. } | Item::Workspaces { .. } => menu,
         };
     }
     menu
