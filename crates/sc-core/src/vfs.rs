@@ -2,16 +2,19 @@
 
 use std::ffi::OsString;
 use std::fs::{self, File};
-use std::io::{self, Read, Write};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::SystemTime;
 
 use crate::Entry;
 
-/// A file being written is named so until it is whole.
-pub const PART: &str = ".pc-part";
+/// A file being written is named so until it is whole; a broken copy's
+/// stays, to go on from.
+pub const PART: &str = ".sc-part";
 const BUFFER: usize = 1 << 20;
+/// How much of a part's end must match the source's there to go on from it.
+const OVERLAP: u64 = 64 * 1024;
 
 #[derive(Clone, Debug, Default)]
 pub struct Meta {
@@ -31,6 +34,14 @@ pub trait Fs: Send + Sync {
     fn list(&self, dir: &Path) -> io::Result<Vec<OsString>>;
     fn open(&self, path: &Path) -> io::Result<Box<dyn Read + Send>>;
     fn create(&self, path: &Path) -> io::Result<Box<dyn Write + Send>>;
+    /// From byte `offset` on, to go on with a broken copy.
+    fn open_at(&self, _path: &Path, _offset: u64) -> io::Result<Box<dyn Read + Send>> {
+        Err(io::ErrorKind::Unsupported.into())
+    }
+    /// Written on at its end, to go on with a broken copy.
+    fn append(&self, _path: &Path) -> io::Result<Box<dyn Write + Send>> {
+        Err(io::ErrorKind::Unsupported.into())
+    }
     /// After writing: the source's time and permissions.
     fn set_meta(&self, path: &Path, meta: &Meta) -> io::Result<()>;
     fn mkdir(&self, path: &Path) -> io::Result<()>;
@@ -54,21 +65,27 @@ pub trait Remote: Fs {
 }
 
 /// Streams `source` to `target` under a part name, renamed when whole, so
-/// a failed copy leaves the target as it was. `copied` hears of each
-/// buffer; its error stops the copy.
+/// a failed copy leaves the target as it was. A broken copy's part stays and
+/// the next copy goes on from it; a cancelled one's goes. `copied` hears of
+/// each buffer, and of a part gone on from (true); its error stops the copy.
 pub fn copy_file(
     from: &dyn Fs,
     source: &Path,
     to: &dyn Fs,
     target: &Path,
     meta: &Meta,
-    copied: &mut dyn FnMut(u64) -> io::Result<()>,
+    copied: &mut dyn FnMut(u64, bool) -> io::Result<()>,
 ) -> io::Result<()> {
     let name = target.file_name().unwrap_or_default().to_string_lossy();
     let part = target.with_file_name(format!("{name}{PART}"));
     let mut write = || -> io::Result<()> {
-        let mut reader = from.open(source)?;
-        let mut writer = to.create(&part)?;
+        let (mut reader, mut writer) = match resumable(from, source, to, &part, meta) {
+            Some((reader, writer, done)) => {
+                copied(done, true)?;
+                (reader, writer)
+            }
+            None => (from.open(source)?, to.create(&part)?),
+        };
         let mut buffer = vec![0; BUFFER];
         loop {
             let read = match reader.read(&mut buffer) {
@@ -78,7 +95,7 @@ pub fn copy_file(
                 Err(err) => return Err(err),
             };
             writer.write_all(&buffer[..read])?;
-            copied(read as u64)?;
+            copied(read as u64, false)?;
         }
         writer.flush()?;
         drop(writer);
@@ -90,10 +107,40 @@ pub fn copy_file(
         Ok(())
     };
     let written = write();
-    if written.is_err() {
+    if written.as_ref().is_err_and(|err| err.kind() == io::ErrorKind::Interrupted) {
         let _ = to.remove(&part, false);
     }
     written
+}
+
+/// A broken copy's part to go on from: shorter than the source, written
+/// since the source last changed, its last bytes the same as the source's
+/// there. The source reader is where the part ends.
+type Resumed = (Box<dyn Read + Send>, Box<dyn Write + Send>, u64);
+
+fn resumable(from: &dyn Fs, source: &Path, to: &dyn Fs, part: &Path, meta: &Meta) -> Option<Resumed> {
+    let written = to.metadata(part).ok()?;
+    let done = written.size;
+    if done == 0 || done >= meta.size {
+        return None;
+    }
+    // Changed since, maybe before where the part ends: from the beginning. In
+    // whole seconds, as servers keep them.
+    let seconds = |time: SystemTime| time.duration_since(SystemTime::UNIX_EPOCH).map_or(0, |since| since.as_secs());
+    if let (Some(changed), Some(written)) = (meta.modified, written.modified)
+        && seconds(changed) > seconds(written)
+    {
+        return None;
+    }
+    let overlap = done.min(OVERLAP);
+    let (mut theirs, mut ours) = (vec![0; overlap as usize], vec![0; overlap as usize]);
+    let mut reader = from.open_at(source, done - overlap).ok()?;
+    reader.read_exact(&mut theirs).ok()?;
+    to.open_at(part, done - overlap).ok()?.read_exact(&mut ours).ok()?;
+    if theirs != ours {
+        return None;
+    }
+    Some((reader, to.append(part).ok()?, done))
 }
 
 /// A server's file in a temporary folder, for the viewer and editors.
@@ -106,7 +153,7 @@ pub fn fetch_until(fs: &dyn Fs, path: &Path, stop: &AtomicBool) -> io::Result<Pa
     let meta = fs.metadata(path)?;
     let dir = crate::archive::fresh_scratch()?;
     let local = dir.join(path.file_name().unwrap_or_default());
-    let copied = copy_file(fs, path, &Local, &local, &meta, &mut |_| match stop.load(Ordering::Relaxed) {
+    let copied = copy_file(fs, path, &Local, &local, &meta, &mut |_, _| match stop.load(Ordering::Relaxed) {
         true => Err(io::Error::new(io::ErrorKind::Interrupted, "stopped")),
         false => Ok(()),
     });
@@ -119,7 +166,7 @@ pub fn fetch_until(fs: &dyn Fs, path: &Path, stop: &AtomicBool) -> io::Result<Pa
 /// The edited temporary file back to the server.
 pub fn upload(local: &Path, fs: &dyn Fs, path: &Path) -> io::Result<()> {
     let meta = Local.metadata(local)?;
-    copy_file(&Local, local, fs, path, &meta, &mut |_| Ok(()))
+    copy_file(&Local, local, fs, path, &meta, &mut |_, _| Ok(()))
 }
 
 /// Removes a folder and all in it, or a file.
@@ -183,6 +230,16 @@ impl Fs for Local {
         Ok(Box::new(File::create(path)?))
     }
 
+    fn open_at(&self, path: &Path, offset: u64) -> io::Result<Box<dyn Read + Send>> {
+        let mut file = File::open(path)?;
+        file.seek(SeekFrom::Start(offset))?;
+        Ok(Box::new(file))
+    }
+
+    fn append(&self, path: &Path) -> io::Result<Box<dyn Write + Send>> {
+        Ok(Box::new(File::options().append(true).open(path)?))
+    }
+
     fn set_meta(&self, path: &Path, meta: &Meta) -> io::Result<()> {
         if let Some(modified) = meta.modified {
             // Unix sets times through any handle, so folders and read-only files get them too.
@@ -218,5 +275,84 @@ impl Fs for Local {
     #[cfg(unix)]
     fn copy_link(&self, from: &Path, to: &Path) -> io::Result<()> {
         std::os::unix::fs::symlink(fs::read_link(from)?, to)
+    }
+}
+
+/// A broken upload to `server` and a broken download from it each go on
+/// from their part; for the servers' tests.
+#[cfg(test)]
+pub(crate) fn resumes_both_ways(server: &dyn Fs, dir: &Path) {
+    let local = std::env::temp_dir().join(format!("sc-resume-server-{}", std::process::id()));
+    fs::create_dir_all(&local).unwrap();
+    let data: Vec<u8> = (0..3 * BUFFER + 123).map(|at| (at % 251) as u8).collect();
+    let source = local.join("big.bin");
+    fs::write(&source, &data).unwrap();
+    let broken = |_: u64, _: bool| -> io::Result<()> { Err(io::ErrorKind::ConnectionReset.into()) };
+    let mut heard = Vec::new();
+    let up = dir.join("resume-up.bin");
+    let meta = Local.metadata(&source).unwrap();
+    assert!(copy_file(&Local, &source, server, &up, &meta, &mut { broken }).is_err());
+    copy_file(&Local, &source, server, &up, &meta, &mut |bytes, _| Ok(heard.push(bytes))).unwrap();
+    assert_eq!(heard[0], BUFFER as u64, "the upload went on");
+    let down = local.join("down.bin");
+    let meta = server.metadata(&up).unwrap();
+    assert!(copy_file(server, &up, &Local, &down, &meta, &mut { broken }).is_err());
+    // A server's reads come in smaller pieces than the buffer.
+    let part = fs::metadata(local.join(format!("down.bin{PART}"))).unwrap().len();
+    heard.clear();
+    copy_file(server, &up, &Local, &down, &meta, &mut |bytes, _| Ok(heard.push(bytes))).unwrap();
+    assert!(part > 0 && heard[0] == part, "the download went on from {part}: {heard:?}");
+    assert_eq!(fs::read(&down).unwrap(), data);
+    server.remove(&up, false).unwrap();
+    fs::remove_dir_all(&local).unwrap();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_broken_copy_goes_on_and_a_cancelled_one_leaves_nothing() {
+        let dir = std::env::temp_dir().join(format!("sc-resume-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let (source, target) = (dir.join("big.bin"), dir.join("copy.bin"));
+        let part = dir.join(format!("copy.bin{PART}"));
+        let data: Vec<u8> = (0..3 * BUFFER + 123).map(|at| (at % 251) as u8).collect();
+        fs::write(&source, &data).unwrap();
+        let meta = Local.metadata(&source).unwrap();
+        let fail = |kind: io::ErrorKind| move |_: u64, _: bool| -> io::Result<()> { Err(kind.into()) };
+
+        // Broken after the first buffer: the part stays, and the next copy goes on from it.
+        assert!(copy_file(&Local, &source, &Local, &target, &meta, &mut fail(io::ErrorKind::ConnectionReset)).is_err());
+        assert_eq!(fs::metadata(&part).unwrap().len(), BUFFER as u64);
+        let mut heard = Vec::new();
+        copy_file(&Local, &source, &Local, &target, &meta, &mut |bytes, resumed| Ok(heard.push((bytes, resumed)))).unwrap();
+        assert_eq!(heard[0], (BUFFER as u64, true));
+        assert_eq!(heard.iter().map(|(bytes, _)| bytes).sum::<u64>(), data.len() as u64);
+        assert_eq!(fs::read(&target).unwrap(), data);
+        assert!(!part.exists());
+
+        // A part that is not this source's start: from the beginning.
+        fs::write(&part, vec![7u8; 1000]).unwrap();
+        copy_file(&Local, &source, &Local, &target, &meta, &mut |_, _| Ok(())).unwrap();
+        assert_eq!(fs::read(&target).unwrap(), data);
+
+        // The source changed since the part was written, though its end matches: from the beginning.
+        assert!(copy_file(&Local, &source, &Local, &target, &meta, &mut fail(io::ErrorKind::ConnectionReset)).is_err());
+        let mut changed = data.clone();
+        changed[0] = 255;
+        fs::write(&source, &changed).unwrap();
+        let later = SystemTime::now() + std::time::Duration::from_secs(5);
+        File::options().write(true).open(&source).unwrap().set_modified(later).unwrap();
+        let meta = Local.metadata(&source).unwrap();
+        let mut heard = Vec::new();
+        copy_file(&Local, &source, &Local, &target, &meta, &mut |_, resumed| Ok(heard.push(resumed))).unwrap();
+        assert!(!heard[0]);
+        assert_eq!(fs::read(&target).unwrap(), changed);
+
+        // Cancelled: no part left.
+        assert!(copy_file(&Local, &source, &Local, &target, &meta, &mut fail(io::ErrorKind::Interrupted)).is_err());
+        assert!(!part.exists());
+        fs::remove_dir_all(&dir).unwrap();
     }
 }

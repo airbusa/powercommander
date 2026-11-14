@@ -16,7 +16,7 @@ use russh::{MethodKind, MethodSet};
 use russh_sftp::client::SftpSession;
 use russh_sftp::client::fs::{File, Metadata};
 use russh_sftp::protocol::{FileAttributes, StatusCode};
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeekExt, AsyncWrite, AsyncWriteExt};
 use tokio::runtime::Runtime;
 
 use crate::Entry;
@@ -34,19 +34,25 @@ static RUNTIME: LazyLock<Runtime> = LazyLock::new(|| {
         .expect("a runtime for SSH")
 });
 
+/// The session and what carries it: SSH, or the program it is piped to.
+type Connection = (Arc<SftpSession>, Box<dyn Any + Send + Sync>);
+
 pub struct Sftp {
     url: String,
     home: PathBuf,
-    /// Taken in `drop`, where the runtime must be at hand; beside the
-    /// session what carries it: SSH, or the program it is piped to.
-    inner: Option<(SftpSession, Box<dyn Any + Send + Sync>)>,
+    /// Where and how it logged in, to log in again once SSH's connection is lost.
+    again: Option<(Address, Ask)>,
+    /// Taken in `drop`, where the runtime must be at hand.
+    inner: Mutex<Option<Connection>>,
 }
 
 impl Sftp {
     /// Connects and logs in, asking `ask` what it must. Blocks: run it off
     /// the UI thread.
     pub fn connect(address: &Address, ask: Ask) -> io::Result<Arc<Self>> {
-        RUNTIME.block_on(connect(address, ask)).map(Arc::new)
+        let mut sftp = RUNTIME.block_on(connect(address, ask.clone()))?;
+        sftp.again = Some((address.clone(), ask));
+        Ok(Arc::new(sftp))
     }
 
     /// Where `address` points, else the login folder.
@@ -83,7 +89,7 @@ impl Sftp {
                 Ok::<_, io::Error>((session, home))
             };
             match started.await {
-                Ok((session, home)) => Ok(Sftp { url, home: home.into(), inner: Some((session, Box::new(child))) }),
+                Ok((session, home)) => Ok(Sftp { url, home: home.into(), again: None, inner: Mutex::new(Some((Arc::new(session), Box::new(child)))) }),
                 Err(err) => {
                     let _ = tokio::time::timeout(Duration::from_secs(5), child.wait()).await;
                     let _ = child.start_kill();
@@ -95,15 +101,28 @@ impl Sftp {
         .map(Arc::new)
     }
 
-    fn session(&self) -> &SftpSession {
-        &self.inner.as_ref().expect("connected until dropped").0
+    /// SSH's connection lost (a broken network, a server restarted): logged
+    /// in again, so Retry goes on.
+    fn session(&self) -> Arc<SftpSession> {
+        let mut inner = self.inner.lock().unwrap_or_else(|err| err.into_inner());
+        let lost = inner.as_ref().and_then(|(_, carrier)| carrier.downcast_ref::<Handle<Client>>()).is_some_and(Handle::is_closed);
+        if lost
+            && let Some((address, ask)) = &self.again
+            // shortcut: not logged in again, the lost session gives the caller its error.
+            && let Ok(mut fresh) = RUNTIME.block_on(connect(address, ask.clone()))
+        {
+            let gone = std::mem::replace(&mut *inner, fresh.inner.get_mut().unwrap_or_else(|err| err.into_inner()).take());
+            let _runtime = RUNTIME.enter();
+            drop(gone);
+        }
+        inner.as_ref().expect("connected until dropped").0.clone()
     }
 }
 
 impl Drop for Sftp {
     fn drop(&mut self) {
         let _runtime = RUNTIME.enter();
-        drop(self.inner.take());
+        drop(self.inner.get_mut().unwrap_or_else(|err| err.into_inner()).take());
     }
 }
 
@@ -167,7 +186,8 @@ async fn connect(address: &Address, ask: Ask) -> io::Result<Sftp> {
     Ok(Sftp {
         url,
         home,
-        inner: Some((session, Box::new(ssh))),
+        again: None,
+        inner: Mutex::new(Some((Arc::new(session), Box::new(ssh)))),
     })
 }
 
@@ -495,6 +515,23 @@ impl Fs for Sftp {
         Ok(Box::new(SyncFile(Some(file))))
     }
 
+    fn open_at(&self, path: &Path, offset: u64) -> io::Result<Box<dyn Read + Send>> {
+        let mut file = SyncFile(Some(block_on(self.session().open(text(path)))?));
+        let opened = file.0.as_mut().expect("just opened");
+        RUNTIME.block_on(opened.seek(io::SeekFrom::Start(offset)))?;
+        Ok(Box::new(file))
+    }
+
+    /// Written from its size on: servers do not all keep to the append flag.
+    fn append(&self, path: &Path) -> io::Result<Box<dyn Write + Send>> {
+        let size = self.metadata(path)?.size;
+        let flags = russh_sftp::protocol::OpenFlags::WRITE;
+        let mut file = SyncFile(Some(block_on(self.session().open_with_flags(text(path), flags))?));
+        let opened = file.0.as_mut().expect("just opened");
+        RUNTIME.block_on(opened.seek(io::SeekFrom::Start(size)))?;
+        Ok(Box::new(file))
+    }
+
     fn set_meta(&self, path: &Path, meta: &Meta) -> io::Result<()> {
         let seconds = meta
             .modified
@@ -609,6 +646,41 @@ impl Drop for SyncFile {
 mod tests {
     use super::*;
 
+    /// Needs PC_SFTP_TEST, and PC_SFTP_CUT: a command that ends the server's
+    /// side of the connection. The download broken so goes on from its part.
+    #[test]
+    #[ignore]
+    fn goes_on_after_the_connection_is_lost() {
+        use crate::vfs::{self, Local};
+        let address = Address::parse(&std::env::var("PC_SFTP_TEST").unwrap()).unwrap();
+        let cut = std::env::var("PC_SFTP_CUT").unwrap();
+        let ask: Ask = Arc::new(|_| Reply::Cancel);
+        let sftp = Sftp::connect(&address, ask).unwrap();
+        let local = std::env::temp_dir().join(format!("sc-sftp-lost-{}", std::process::id()));
+        std::fs::create_dir_all(&local).unwrap();
+        let data: Vec<u8> = (0..8 << 20).map(|at| (at % 251) as u8).collect();
+        std::fs::write(local.join("big.bin"), &data).unwrap();
+        let remote = sftp.start(&address).join("lost.bin");
+        let meta = Local.metadata(&local.join("big.bin")).unwrap();
+        vfs::copy_file(&Local, &local.join("big.bin"), &*sftp, &remote, &meta, &mut |_, _| Ok(())).unwrap();
+        let (down, meta) = (local.join("down.bin"), sftp.metadata(&remote).unwrap());
+        let mut cut_once = Some(cut);
+        let broken = vfs::copy_file(&*sftp, &remote, &Local, &down, &meta, &mut |_, _| {
+            if let Some(cut) = cut_once.take() {
+                std::process::Command::new("sh").arg("-c").arg(cut).status().unwrap();
+                std::thread::sleep(Duration::from_millis(300));
+            }
+            Ok(())
+        });
+        assert!(broken.is_err());
+        let mut resumed = false;
+        vfs::copy_file(&*sftp, &remote, &Local, &down, &meta, &mut |_, from_part| Ok(resumed |= from_part)).unwrap();
+        assert!(resumed);
+        assert_eq!(std::fs::read(&down).unwrap(), data);
+        sftp.remove(&remote, false).unwrap();
+        std::fs::remove_dir_all(&local).unwrap();
+    }
+
     /// Needs a server: PC_SFTP_TEST=sftp://user@host:port/dir, with a key
     /// it takes in $HOME/.ssh. The first run trusts the host key.
     #[test]
@@ -633,6 +705,7 @@ mod tests {
         });
         let sftp = Sftp::connect(&address, ask.clone()).unwrap();
         let dir = sftp.start(&address);
+        crate::vfs::resumes_both_ways(&*sftp, &dir);
         let names: Vec<String> = sftp
             .entries(&dir)
             .unwrap()

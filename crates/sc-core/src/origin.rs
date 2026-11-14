@@ -108,7 +108,7 @@ fn fetch(fs: &dyn Fs, path: &Path, report: &mut Report) -> io::Result<PathBuf> {
     report.show();
     let local = crate::archive::fresh_scratch()?.join(path.file_name().unwrap_or_default());
     let mut shown = Instant::now();
-    vfs::copy_file(fs, path, &Local, &local, &meta, &mut |read| {
+    vfs::copy_file(fs, path, &Local, &local, &meta, &mut |read, _| {
         report.progress.bytes += read;
         if shown.elapsed() > Duration::from_millis(100) {
             report.show();

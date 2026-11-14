@@ -404,6 +404,25 @@ impl Fs for Ftp {
         ))
     }
 
+    /// REST, then RETR.
+    fn open_at(&self, path: &Path, offset: u64) -> io::Result<Box<dyn Read + Send>> {
+        let path = text(path);
+        let offset = usize::try_from(offset).map_err(io::Error::other)?;
+        Ok(Box::new(self.transfer(|stream| {
+            stream.resume_transfer(offset)?;
+            // Refused, the connection goes back to the pool: without the offset.
+            stream.retr_as_stream(&path).inspect_err(|_| {
+                let _ = stream.resume_transfer(0);
+            })
+        })?))
+    }
+
+    /// APPE.
+    fn append(&self, path: &Path) -> io::Result<Box<dyn Write + Send>> {
+        let path = text(path);
+        Ok(Box::new(self.transfer(|stream| stream.append_with_stream(&path))?))
+    }
+
     /// Where the server can: the time by MFMT, the mode by SITE CHMOD.
     fn set_meta(&self, path: &Path, meta: &Meta) -> io::Result<()> {
         let path = text(path);
@@ -735,6 +754,7 @@ mod tests {
         });
         let ftp = Ftp::connect(&address, ask.clone()).unwrap();
         let dir = ftp.start(&address);
+        crate::vfs::resumes_both_ways(&*ftp, &dir);
         let names: Vec<String> = ftp
             .entries(&dir)
             .unwrap()

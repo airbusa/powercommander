@@ -450,7 +450,7 @@ impl Commander {
             (seconds > 1. && !p.scanning).then(|| {
                 format!(
                     "{}/s",
-                    sc_core::human_size((p.bytes as f64 / seconds) as u64)
+                    sc_core::human_size(((p.bytes - p.resumed) as f64 / seconds) as u64)
                 )
             })
         });

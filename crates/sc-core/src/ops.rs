@@ -90,6 +90,8 @@ pub struct Progress {
     pub current: PathBuf,
     /// Files left out: by the overwrite choice or after an error.
     pub skipped: u64,
+    /// Of `bytes`, broken copies' parts gone on from: not copied now, so not in the speed.
+    pub resumed: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -698,20 +700,23 @@ impl Run<'_> {
     }
 
     /// Written under a part name and renamed when whole, so a failed or
-    /// cancelled copy leaves the target as it was.
+    /// cancelled copy leaves the target as it was; a broken one goes on from its part.
     fn copy_file(&mut self, source: &Path, target: &Path, meta: &Meta) -> io::Result<()> {
         let (from, to) = (self.op.from.clone(), self.op.to.clone());
-        let before = self.progress.bytes;
-        let written = vfs::copy_file(&*from, source, &*to, target, meta, &mut |bytes| {
+        let before = (self.progress.bytes, self.progress.resumed);
+        let written = vfs::copy_file(&*from, source, &*to, target, meta, &mut |bytes, resumed| {
             if self.cancel.load(Ordering::Relaxed) {
                 return Err(io::ErrorKind::Interrupted.into());
             }
             self.progress.bytes += bytes;
+            if resumed {
+                self.progress.resumed += bytes;
+            }
             self.report();
             Ok(())
         });
         if written.is_err() {
-            self.progress.bytes = before;
+            (self.progress.bytes, self.progress.resumed) = before;
         }
         written
     }
