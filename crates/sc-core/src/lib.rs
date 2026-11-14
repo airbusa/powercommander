@@ -306,7 +306,8 @@ pub fn human_size(bytes: u64) -> String {
         0..K => format!("{bytes} B"),
         K..1_048_576 => format!("{:.1} KB", bytes as f64 / K as f64),
         1_048_576..1_073_741_824 => format!("{:.1} MB", bytes as f64 / 1_048_576.),
-        _ => format!("{:.2} GB", bytes as f64 / 1_073_741_824.),
+        1_073_741_824..1_099_511_627_776 => format!("{:.2} GB", bytes as f64 / 1_073_741_824.),
+        _ => format!("{:.2} TB", bytes as f64 / 1_099_511_627_776.),
     }
 }
 

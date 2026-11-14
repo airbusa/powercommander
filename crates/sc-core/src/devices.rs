@@ -55,6 +55,37 @@ pub fn unmount_volume(volume: &Volume) -> io::Result<()> {
     }
 }
 
+/// A mounted volume's size and the space its user may still fill, in bytes.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub fn disk_space(path: &Path) -> io::Result<(u64, u64)> {
+    use std::os::unix::ffi::OsStrExt;
+    let path = std::ffi::CString::new(path.as_os_str().as_bytes())?;
+    // SAFETY: a zeroed statvfs is valid, and the call fills it.
+    let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
+    if unsafe { libc::statvfs(path.as_ptr(), &mut stat) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let unit = stat.f_frsize as u64;
+    Ok((stat.f_blocks as u64 * unit, stat.f_bavail as u64 * unit))
+}
+
+#[cfg(windows)]
+pub fn disk_space(path: &Path) -> io::Result<(u64, u64)> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows::Win32::Storage::FileSystem::GetDiskFreeSpaceExW;
+    use windows::core::PCWSTR;
+    let wide: Vec<u16> = path.as_os_str().encode_wide().chain([0]).collect();
+    let (mut free, mut total) = (0u64, 0u64);
+    // SAFETY: a NUL-ended path, and two u64s for the answers.
+    unsafe { GetDiskFreeSpaceExW(PCWSTR(wide.as_ptr()), Some(&mut free), Some(&mut total), None) }.map_err(io::Error::other)?;
+    Ok((total, free))
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+pub fn disk_space(_: &Path) -> io::Result<(u64, u64)> {
+    Err(io::Error::from(io::ErrorKind::Unsupported))
+}
+
 #[cfg(target_os = "linux")]
 fn platform_volumes() -> Vec<Volume> {
     let runtime = std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from);
@@ -479,6 +510,13 @@ mod kde_connect {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(any(target_os = "linux", target_os = "macos", windows))]
+    #[test]
+    fn reads_a_disks_size_and_free_space() {
+        let (size, free) = disk_space(&std::env::temp_dir()).unwrap();
+        assert!(size > 0 && free <= size);
+    }
 
     #[test]
     fn finds_network_shares_but_phones() {

@@ -566,11 +566,26 @@ impl Commander {
             VolumeKind::Phone => Icon::new(Lucide::Smartphone),
         };
         let detail = if volume.path.is_none() { "not mounted" } else { "" };
+        // A disk's size and free space, under its name; not a share's, which may hang.
+        let disk = matches!(volume.kind, VolumeKind::System | VolumeKind::Drive | VolumeKind::Removable);
+        let space = (volume.path.as_deref().filter(|_| disk))
+            .and_then(|path| devices::disk_space(path).ok())
+            .map(|(size, free)| format!("{} free of {}", sc_core::human_size(free), sc_core::human_size(size)));
         let (opened, menu_volume) = (volume.clone(), volume.clone());
         let commander = cx.entity().downgrade();
+        let name = v_flex()
+            .map(|el| match space.is_some() {
+                true => el.flex_1().min_w_0(),
+                false => el.flex_none().max_w(relative(0.7)),
+            })
+            .child(div().truncate().child(volume.name.clone()))
+            .when_some(space.clone(), |el, space| el.child(div().truncate().text_xs().text_color(theme.muted_foreground).child(space)));
         h_flex()
             .id(("volume", ix))
-            .h(ROW + px(2.))
+            .map(|el| match space.is_some() {
+                true => el.py_0p5(),
+                false => el.h(ROW + px(2.)),
+            })
             .px_1()
             .gap_1p5()
             .rounded(theme.radius)
@@ -578,8 +593,8 @@ impl Commander {
             .when(selected, |el| el.bg(self.colors.sidebar_selection))
             .when(!selected, |el| el.hover(|style| style.bg(theme.foreground.opacity(0.06))))
             .child(icon.small().text_color(theme.muted_foreground))
-            .child(div().flex_none().max_w(relative(0.7)).truncate().child(volume.name.clone()))
-            .child(div().flex_1().min_w_0().truncate().text_xs().text_color(theme.muted_foreground).child(detail))
+            .child(name)
+            .when(!detail.is_empty(), |el| el.child(div().flex_1().min_w_0().truncate().text_xs().text_color(theme.muted_foreground).child(detail)))
             .on_click(cx.listener(move |this, _, window, cx| this.open_volume(opened.clone(), window, cx)))
             .context_menu(move |menu, _, _| {
                 let act = |label: &'static str, unmount: bool| {
