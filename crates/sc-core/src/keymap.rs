@@ -119,6 +119,8 @@ const SPARK_COMMANDER: Table = &[
     (GoHome, "alt-h", ""),
     (BranchView, "ctrl-shift-b", ""),
     (SwapPanels, "ctrl-u", ""),
+    // Krusader's.
+    (SyncBrowsing, "alt-shift-y", ""),
     (Disconnect, "secondary-shift-k", ""),
     (SidebarTree, "ctrl-shift-f8", ""),
     (SidebarConnections, "ctrl-shift-f9", ""),
@@ -263,6 +265,7 @@ const KRUSADER: Table = &[
     (HiddenFiles, "ctrl-.", ""),
     (SynchronizeDirs, "ctrl-y", ""),
     (SwapPanels, "ctrl-u", ""),
+    (SyncBrowsing, "alt-shift-y", ""),
     (Bookmarks, "ctrl-d", ""),
     (GoBack, "alt-left", ""),
     (GoForward, "alt-right", ""),

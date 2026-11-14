@@ -1228,6 +1228,22 @@ impl Panel {
         self.go_to(path, None)
     }
 
+    /// Where synchronized browsing follows it: its folder, with the server's
+    /// address on one; none in an archive or search results.
+    pub fn spot(&self) -> Option<(Option<String>, PathBuf)> {
+        let server = self.remote.as_ref().map(|remote| remote.url());
+        (self.archive.is_none() && self.found.is_none()).then(|| (server, self.path.clone()))
+    }
+
+    /// Synchronized browsing: the other panel's move from `from` to `to` made here too.
+    pub fn follow(&mut self, from: &Path, to: &Path) -> io::Result<()> {
+        let (target, left) = followed(from, to, &self.path)
+            .ok_or_else(|| io::Error::other("the other panel went to another drive"))?;
+        // Named, as it is not where the panel is.
+        let named = |err: io::Error| io::Error::new(err.kind(), format!("{}: {err}", target.display()));
+        self.go_to(target.clone(), left).map_err(named)
+    }
+
     /// The top of what it shows: the archive's, the server's, the drive's or `/`.
     pub fn go_to_root(&mut self) -> io::Result<()> {
         if self.archive.is_some() {
@@ -1652,6 +1668,26 @@ impl Tabs {
 }
 
 /// Save Selection To File: a name a line.
+/// Synchronized browsing, as Krusader's: where a panel at `here` goes when the
+/// other moved from `from` to `to`: as many folders up (no higher than its
+/// root), then down by the same names. Only up, the folder it left gets the
+/// cursor, as Up's. None for a move to another drive.
+fn followed(from: &Path, to: &Path, here: &Path) -> Option<(PathBuf, Option<OsString>)> {
+    let same = from.components().zip(to.components()).take_while(|(a, b)| a == b).count();
+    if same == 0 {
+        return None;
+    }
+    let up = from.components().count() - same;
+    let above: Vec<&Path> = here.ancestors().collect();
+    let top = above[up.min(above.len() - 1)];
+    let down: PathBuf = to.components().skip(same).collect();
+    if !down.as_os_str().is_empty() {
+        return Some((top.join(down), None));
+    }
+    let left = up.min(above.len() - 1).checked_sub(1).and_then(|ix| above[ix].file_name());
+    Some((top.to_owned(), left.map(OsString::from)))
+}
+
 pub fn save_selection(path: &Path, names: &[OsString]) -> io::Result<()> {
     let lines: Vec<String> = names
         .iter()
@@ -1819,6 +1855,19 @@ fn by_name(a: &Entry, b: &Entry) -> Ordering {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn follows_the_other_panel() {
+        let at = |from: &str, to: &str, here: &str| followed(Path::new(from), Path::new(to), Path::new(here));
+        let some = |path: &str, left: Option<&str>| Some((PathBuf::from(path), left.map(OsString::from)));
+        assert_eq!(at("/a/b", "/a/b/c", "/x/y"), some("/x/y/c", None));
+        assert_eq!(at("/a/b/c", "/a/b", "/x/y/c"), some("/x/y", Some("c")));
+        assert_eq!(at("/a/b/c", "/a/d", "/x/y/c"), some("/x/d", None));
+        // No higher than its root.
+        assert_eq!(at("/a/b/c", "/", "/x"), some("/", Some("x")));
+        assert_eq!(at("/a", "/", "/"), some("/", None));
+        assert_eq!(at("a/b", "c/d", "/x"), None);
+    }
 
     #[test]
     fn shows_search_results() {

@@ -82,6 +82,8 @@ pub struct App {
     searches: Option<Searches>,
     /// Save Selection's names, for Restore Selection.
     saved: Vec<std::ffi::OsString>,
+    /// Synchronized browsing: the other panel makes the active one's moves too.
+    sync_browsing: bool,
     /// How the terminal draws pictures; asked at the start.
     picker: Option<Picker>,
     done: (mpsc::Sender<Done>, mpsc::Receiver<Done>),
@@ -175,6 +177,7 @@ impl App {
             foreground: None,
             searches: None,
             saved: Vec::new(),
+            sync_browsing: false,
             picker: None,
             done: mpsc::channel(),
             quit: false,
@@ -282,9 +285,25 @@ impl App {
 
     fn navigate_on(&mut self, ix: usize, go: impl FnOnce(&mut Panel) -> io::Result<()>) {
         let tabs = &mut self.sides[ix].tabs;
+        let before = tabs.current().spot();
         if let Err(err) = tabs.navigate(go) {
             let text = format!("{}: {err}", tabs.current().location());
-            self.say(text, true);
+            return self.say(text, true);
+        }
+        // Synchronized browsing: the other panel makes the move too.
+        let after = self.sides[ix].tabs.current().spot();
+        if self.sync_browsing
+            && ix == self.active
+            && self.sides[1 - ix].tabs.current().spot().is_some()
+            && let (Some((_, from)), Some((_, to))) = (before, after)
+            && from != to
+        {
+            let other = &mut self.sides[1 - ix].tabs;
+            if let Err(err) = other.navigate(|panel| panel.follow(&from, &to)) {
+                self.sync_browsing = false;
+                let text = format!("{err}. Synchronized browsing is off.");
+                self.say(text, true);
+            }
         }
     }
 
@@ -452,6 +471,11 @@ impl App {
                 });
             }
             Command::RereadSource => self.navigate(Panel::reload),
+            Command::SyncBrowsing => {
+                self.sync_browsing = !self.sync_browsing;
+                let on = if self.sync_browsing { "on" } else { "off" };
+                self.say(format!("Synchronized browsing is {on}."), false);
+            }
             Command::SelectGroup | Command::UnselectGroup => {
                 let mark = command == Command::SelectGroup;
                 let title = if mark {
@@ -736,6 +760,27 @@ mod tests {
             matches!(app.foreground.take(), Some(Foreground::Shell(line, at)) if line == "l" && at == root),
             "for the shell"
         );
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn other_panel_follows_with_synchronized_browsing() {
+        let root = std::env::temp_dir().join(format!("sc-tui-sync-{}", std::process::id()));
+        for dir in ["a/x", "a/only", "b/x"] {
+            std::fs::create_dir_all(root.join(dir)).unwrap();
+        }
+        let folders = [root.join("a"), root.join("b")].into_iter();
+        let mut app = App::new(Settings::default(), &Session::default(), folders);
+        app.key(KeyEvent::new(KeyCode::Char('Y'), KeyModifiers::ALT | KeyModifiers::SHIFT));
+        assert!(app.sync_browsing, "Alt+Shift+Y");
+        let other = |app: &App| app.sides[1].tabs.current().path();
+        app.navigate(|panel| panel.go_to_folder(root.join("a/x")));
+        assert_eq!(other(&app), root.join("b/x"));
+        app.navigate(Panel::up);
+        assert_eq!(other(&app), root.join("b"));
+        app.navigate(|panel| panel.go_to_folder(root.join("a/only")));
+        assert_eq!(other(&app), root.join("b"));
+        assert!(!app.sync_browsing, "off where the other panel cannot follow");
         std::fs::remove_dir_all(&root).unwrap();
     }
 

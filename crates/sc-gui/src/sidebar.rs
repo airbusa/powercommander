@@ -230,14 +230,16 @@ impl Commander {
     fn open_folder(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
         let side = &mut self.panels[self.active];
         let remote = side.tabs.current().remote().is_some();
+        let before = side.tabs.current().spot();
         let went = side.tabs.navigate(|panel| match remote {
             true => panel.disconnect(path.clone()),
             false => panel.go_to_folder(path.clone()),
         });
-        if let Err(err) = went {
-            window.push_notification(Notification::error(format!("{}: {err}", path.display())), cx);
-        }
         side.scroll_to_cursor();
+        match went {
+            Ok(()) => self.follow(self.active, before, window, cx),
+            Err(err) => window.push_notification(Notification::error(format!("{}: {err}", path.display())), cx),
+        }
         cx.notify();
     }
 

@@ -102,7 +102,7 @@ actions!(
 include!(concat!(env!("OUT_DIR"), "/material_icons.rs"));
 
 // Lucide icons beyond GPUI Kit's own set.
-gpui_kit::assets::icon_assets!(ExtraIcons, [PanelsTopLeft, Type, CalendarClock, Languages, FilePen, Puzzle, Server, Smartphone, Tablet, Laptop, Monitor, Tv, Usb, Menu, Cloud, CaseSensitive, WholeWord, Regex, Replace, ReplaceAll, CaseUpper, SquareDashedText, X, Funnel]);
+gpui_kit::assets::icon_assets!(ExtraIcons, [PanelsTopLeft, Type, CalendarClock, Languages, FilePen, Puzzle, Server, Smartphone, Tablet, Laptop, Monitor, Tv, Usb, Menu, Cloud, CaseSensitive, WholeWord, Regex, Replace, ReplaceAll, CaseUpper, SquareDashedText, X, Funnel, Link]);
 
 /// GPUI Kit's icons, the file icons as `material/<name>.svg`, the player's as `media/`.
 struct AppAssets;
@@ -507,6 +507,8 @@ struct Commander {
     app_icons: app_icons::AppIcons,
     /// The panels one above the other.
     vertical: bool,
+    /// Synchronized browsing: the other panel makes the active one's moves too.
+    sync_browsing: bool,
     /// The built-in terminal's shells and the one shown; shown or not, and its height.
     terminals: Vec<terminal_pane::TerminalTab>,
     terminal_tab: usize,
@@ -664,6 +666,7 @@ impl Commander {
             thumbnails: views::Thumbnails::default(),
             app_icons: app_icons::AppIcons::default(),
             vertical: session.vertical,
+            sync_browsing: false,
             terminals: Vec::new(),
             terminal_tab: 0,
             terminal_shown: false,
@@ -748,6 +751,7 @@ impl Commander {
             || (command == Command::QuickViewPanel && self.quick.is_some())
             || (command == Command::TerminalPanel && self.terminal_shown)
             || (command == Command::HiddenFiles && self.settings.show_hidden)
+            || (command == Command::SyncBrowsing && self.sync_browsing)
             || (command == Command::BranchView && self.panels[self.active].tabs.current().found_label() == Some("Branch view:"))
             || self.filter_checked(command)
     }
@@ -1240,9 +1244,11 @@ impl Commander {
             }
         };
         let side = &mut self.panels[ix];
+        let before = side.tabs.current().spot();
         match side.tabs.navigate(|panel| panel.go_to_folder(target.clone())) {
             Ok(()) => {
                 side.scroll_to_cursor();
+                self.follow(ix, before, window, cx);
                 true
             }
             Err(err) => {
@@ -1643,13 +1649,11 @@ impl Commander {
         cx: &mut Context<Self>,
     ) {
         let side = &mut self.panels[ix];
+        let before = side.tabs.current().spot();
         if !background {
-            if let Err(err) = side.tabs.navigate(go) {
-                let text = format!("{}: {err}", side.tabs.current().location());
-                window.push_notification(Notification::error(text), cx);
-                if sidebar::lost_device(&err) {
-                    self.reconnect_devices(window, cx);
-                }
+            match side.tabs.navigate(go) {
+                Ok(()) => self.follow(ix, before, window, cx),
+                Err(err) => self.move_failed(ix, err, window, cx),
             }
             self.panels[ix].scroll_to_cursor();
             return cx.notify();
@@ -1662,24 +1666,59 @@ impl Commander {
                 .spawn(async move { go(&mut moved).map(|()| moved) });
             let went = went.await;
             let _ = this.update_in(cx, |this, window, cx| {
-                let side = &mut this.panels[ix];
                 match went {
-                    Ok(moved) => side.tabs.navigated(tab, moved),
+                    Ok(moved) => {
+                        this.panels[ix].tabs.navigated(tab, moved);
+                        this.follow(ix, before, window, cx);
+                    }
                     // Cancelled: as it was.
                     Err(err) if err.kind() == io::ErrorKind::Interrupted => {}
-                    Err(err) => {
-                        let text = format!("{}: {err}", side.tabs.current().location());
-                        window.push_notification(Notification::error(text), cx);
-                        if sidebar::lost_device(&err) {
-                            this.reconnect_devices(window, cx);
-                        }
-                    }
+                    Err(err) => this.move_failed(ix, err, window, cx),
                 }
                 this.panels[ix].scroll_to_cursor();
                 cx.notify();
             });
         })
         .detach();
+    }
+
+    fn move_failed(&mut self, ix: usize, err: io::Error, window: &mut Window, cx: &mut Context<Self>) {
+        let mut text = format!("{}: {err}", self.panels[ix].tabs.current().location());
+        // The other panel could not follow.
+        if self.sync_browsing && ix != self.active {
+            text = format!("{err}. Synchronized browsing is off.");
+            self.set_sync_browsing(false, cx);
+        }
+        window.push_notification(Notification::error(text), cx);
+        if sidebar::lost_device(&err) {
+            self.reconnect_devices(window, cx);
+        }
+    }
+
+    fn set_sync_browsing(&mut self, on: bool, cx: &mut Context<Self>) {
+        self.sync_browsing = on;
+        self.reload_menus(cx);
+        cx.notify();
+    }
+
+    /// Synchronized browsing: the other panel makes panel `ix`'s move from
+    /// `before` too, when both show folders on the same computer or server.
+    fn follow(&mut self, ix: usize, before: Option<(Option<String>, PathBuf)>, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.sync_browsing || ix != self.active {
+            return;
+        }
+        let other = self.panels[1 - ix].tabs.current();
+        let (Some((server, from)), Some((server_now, to)), Some(_)) =
+            (before, self.panels[ix].tabs.current().spot(), other.spot())
+        else {
+            return;
+        };
+        if server != server_now || from == to {
+            return;
+        }
+        // shortcut: on a server it follows from where it was before its last follow ended; fine unless keys outrun the server.
+        let remote = other.remote().is_some();
+        self.navigate_on(1 - ix, remote, move |panel| panel.follow(&from, &to), window, cx);
     }
 
     /// A panel, or Quick View where it covers it.
@@ -1957,6 +1996,19 @@ impl Commander {
                     .child(div().flex_1().min_w_0().truncate().child(panel.location()))
                     // The filter stays in sight however long the path.
                     .children(filter_suffix(panel).map(|filter| div().flex_none().child(filter)))
+                    .when(self.sync_browsing, |el| {
+                        el.child(
+                            Button::new(("sync", ix))
+                                .ghost()
+                                .xsmall()
+                                .icon(gpui_kit::assets::IconName::Link)
+                                .tooltip("Synchronized Browsing (click to stop)")
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    cx.stop_propagation();
+                                    this.set_sync_browsing(false, cx);
+                                })),
+                        )
+                    })
                     // A server's, or a phone's KDE Connect mounted.
                     .when(panel.remote().is_some() || self.device_of(panel.folder()).is_some(), |el| {
                         el.child(
@@ -2342,6 +2394,7 @@ impl Render for Commander {
                     Command::SwapPanels => this.swap_panels(false, cx),
                     Command::SwapPanelsAndTabs => this.swap_panels(true, cx),
                     Command::TargetEqualsSource => this.target_equals_source(cx),
+                    Command::SyncBrowsing => this.set_sync_browsing(!this.sync_browsing, cx),
                     Command::OpenInLeftPanel => this.show_in(0, window, cx),
                     Command::OpenInRightPanel => this.show_in(1, window, cx),
                     Command::GoToRoot => this.go_to_root(window, cx),

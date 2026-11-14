@@ -78,6 +78,8 @@ pub enum Command {
     ActivityLog,
     SwapPanels,
     TargetEqualsSource,
+    /// The other panel makes the active one's moves too, as Krusader's.
+    SyncBrowsing,
     // Show
     Brief,
     Full,
@@ -319,6 +321,7 @@ pub const MENUS: &[Menu] = &[
             cmd("Swap Panels", SwapPanels),
             cmd("Swap Panels With Their Tabs", SwapPanelsAndTabs),
             cmd("Target = Source", TargetEqualsSource),
+            cmd("Synchronized Browsing", SyncBrowsing),
         ],
     },
     Menu {
