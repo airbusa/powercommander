@@ -2470,12 +2470,6 @@ impl Render for Commander {
             .on_action(cx.listener(|this, ReopenTab(ix): &ReopenTab, window, cx| {
                 this.reopen_tab(*ix, window, cx)
             }))
-            .on_action(cx.listener(|this, OpenWorkspace(ix): &OpenWorkspace, window, cx| {
-                this.open_workspace(*ix, window, cx)
-            }))
-            .on_action(cx.listener(|this, SetAppearance(chosen): &SetAppearance, window, cx| {
-                this.set_appearance(*chosen, window, cx)
-            }))
             .on_drag_move(
                 cx.listener(|this, event: &DragMoveEvent<SplitDrag>, _, cx| {
                     let (bounds, at) = (event.bounds, event.event.position);
@@ -2561,6 +2555,13 @@ impl Render for Commander {
                         .child(self.menu_bar.clone()),
                 )
             })
+            // The menus' own choices, wherever the keys are: the terminal, the sidebar.
+            .on_action(cx.listener(|this, OpenWorkspace(ix): &OpenWorkspace, window, cx| {
+                this.open_workspace(*ix, window, cx)
+            }))
+            .on_action(cx.listener(|this, SetAppearance(chosen): &SetAppearance, window, cx| {
+                this.set_appearance(*chosen, window, cx)
+            }))
             .child(
                 h_flex()
                     .flex_1()

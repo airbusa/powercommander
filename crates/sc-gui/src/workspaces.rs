@@ -40,11 +40,11 @@ impl Commander {
         }
     }
 
-    /// Into the menu and the file.
+    /// Into the menu and the files; the session too, else a crash would start the open one with another's tabs.
     fn workspaces_changed(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         menus::set_workspaces(&self.workspaces);
         self.reload_menus(cx);
-        if let Err(err) = self.workspaces.save() {
+        if let Err(err) = self.session().save().and_then(|()| self.workspaces.save()) {
             window.push_notification(Notification::error(format!("Could not save the workspaces: {err}")), cx);
         }
         cx.notify();
