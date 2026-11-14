@@ -162,7 +162,7 @@ impl FileFilter {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum SortKey {
     #[default]
     Name,
@@ -186,7 +186,8 @@ pub enum View {
     Thumbnails,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct Sort {
     pub key: SortKey,
     pub descending: bool,
@@ -489,6 +490,9 @@ impl Panel {
         panel.name = state.name.clone();
         panel.view = state.view;
         panel.history = state.history.clone();
+        if state.sort != panel.sort {
+            panel.set_sort(state.sort);
+        }
         Ok(panel)
     }
 
@@ -501,6 +505,7 @@ impl Panel {
             url: self.remote.as_ref().map(|remote| remote.url()),
             view: self.view,
             history: self.history.clone(),
+            sort: self.sort,
         }
     }
 

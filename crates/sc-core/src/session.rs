@@ -23,6 +23,19 @@ pub struct Session {
     pub vertical: bool,
     /// The terminal's height in pixels; 0 before it was dragged.
     pub terminal_height: f32,
+    /// The main window's place and size; none before the first run.
+    pub window: Option<WindowPlace>,
+}
+
+/// Where the main window was, in logical pixels; maximized, its size before.
+#[derive(Clone, Copy, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct WindowPlace {
+    pub x: f32,
+    pub y: f32,
+    pub width: f32,
+    pub height: f32,
+    pub maximized: bool,
 }
 
 /// Both panels' tabs and the terminal's: what a workspace keeps.
@@ -59,6 +72,7 @@ pub struct TabState {
     pub url: Option<String>,
     pub view: crate::View,
     pub history: crate::History,
+    pub sort: crate::Sort,
 }
 
 /// A terminal tab: a shell in its folder, or ssh.

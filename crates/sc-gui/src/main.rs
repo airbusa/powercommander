@@ -70,7 +70,7 @@ use gpui_kit::*;
 use sc_core::command::{self, Outcome};
 use sc_core::menu::{BUTTON_BAR, Command, Item, TAB_MENU};
 use sc_core::remote::Address;
-use sc_core::session::{Session, SideState, Workspaces};
+use sc_core::session::{Session, SideState, WindowPlace, Workspaces};
 use sc_core::settings::{self, Settings};
 use sc_core::sidebar::SidebarTab;
 use sc_core::theme::{self, Appearance};
@@ -282,8 +282,9 @@ fn main() {
         if std::env::var_os("PC_STYLE_PREVIEW").is_some() {
             return style_preview::open(cx);
         }
+        let saved = Session::load().ok().and_then(|session| session.window).and_then(|place| placed(place, cx));
         let options = WindowOptions {
-            window_bounds: Some(WindowBounds::centered(size(px(1200.), px(800.)), cx)),
+            window_bounds: Some(saved.unwrap_or_else(|| WindowBounds::centered(size(px(1200.), px(800.)), cx))),
             titlebar: Some(TitlebarOptions {
                 title: Some("Spark Commander".into()),
                 ..Default::default()
@@ -510,6 +511,8 @@ struct Commander {
     vertical: bool,
     /// Synchronized browsing: the other panel makes the active one's moves too.
     sync_browsing: bool,
+    /// The window's place and size, kept for the next start.
+    bounds: WindowBounds,
     workspaces: Workspaces,
     /// The workspaces left this run, by their place in the list: as they were, shells running.
     parked: Vec<Option<workspaces::Parked>>,
@@ -595,13 +598,15 @@ impl Commander {
             async {}
         });
         let this = cx.weak_entity();
-        window.on_window_should_close(cx, move |_, cx| {
+        window.on_window_should_close(cx, move |window, cx| {
             let _ = this.update(cx, |this, _| {
+                this.bounds = window.window_bounds();
                 this.save_session();
                 this.transfers.queue.stop_all();
             });
             true
         });
+        cx.observe_window_bounds(window, |this, window, _| this.bounds = window.window_bounds()).detach();
         Self::watch_queue(window, cx);
         Self::watch_devices(cx);
         // Back from another program, which may have changed the folders.
@@ -670,6 +675,7 @@ impl Commander {
             app_icons: app_icons::AppIcons::default(),
             vertical: session.vertical,
             sync_browsing: false,
+            bounds: window.window_bounds(),
             parked: workspaces.list.iter().map(|_| None).collect(),
             workspaces,
             switches: 0,
@@ -1424,6 +1430,7 @@ impl Commander {
             sidebar_width: self.sidebar.width,
             vertical: self.vertical,
             terminal_height: self.terminal_height,
+            window: Some(window_place(self.bounds)),
         }
     }
 
@@ -2530,7 +2537,7 @@ impl Render for Commander {
             .min_w_0()
             .h_full()
             .child(v_flex().flex_1().min_h_0().bg(background).child(panels))
-            .children(self.render_terminal(cx))
+            .children(self.render_terminal(window, cx))
             .child(
                 v_flex()
                     .bg(background)
@@ -2632,6 +2639,29 @@ pub(crate) fn window_icon() -> Option<std::sync::Arc<image::RgbaImage>> {
 
 /// The system's look, light or dark as chosen; on Xfce, MATE and Cinnamon
 /// always their theme's, which GTK draws only as it is.
+/// The saved window place, if a display still shows it; else none.
+fn placed(place: WindowPlace, cx: &App) -> Option<WindowBounds> {
+    let bounds = Bounds {
+        origin: point(px(place.x), px(place.y)),
+        size: size(px(place.width.max(600.)), px(place.height.max(400.))),
+    };
+    let shown = cx.displays().iter().any(|display| display.bounds().intersects(&bounds));
+    (shown && place.width > 0.).then(|| match place.maximized {
+        true => WindowBounds::Maximized(bounds),
+        false => WindowBounds::Windowed(bounds),
+    })
+}
+
+/// Full screen comes back maximized.
+fn window_place(bounds: WindowBounds) -> WindowPlace {
+    let (maximized, size) = match bounds {
+        WindowBounds::Windowed(size) => (false, size),
+        WindowBounds::Maximized(size) | WindowBounds::Fullscreen(size) => (true, size),
+    };
+    let (origin, size) = (size.origin, size.size);
+    WindowPlace { x: origin.x.into(), y: origin.y.into(), width: size.width.into(), height: size.height.into(), maximized }
+}
+
 /// A side's tabs as saved; without them, the home folder's (or /).
 fn restore_side(state: Option<&SideState>, filter: sc_core::Filter) -> Tabs {
     let fallback = || {

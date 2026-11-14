@@ -242,7 +242,9 @@ impl Commander {
     }
 
     /// The terminal under the panels, its top edge dragged for its height.
-    pub(crate) fn render_terminal(&self, cx: &mut Context<Self>) -> Option<impl IntoElement + use<>> {
+    /// At most half the window high, its height kept for when the window grows again.
+    pub(crate) fn render_terminal(&self, window: &Window, cx: &mut Context<Self>) -> Option<impl IntoElement + use<>> {
+        let half = f32::from(window.viewport_size().height) * 0.5;
         let tab = self.terminal_tab().filter(|_| self.terminal_shown)?;
         let edge = div()
             .id("terminal-edge")
@@ -257,11 +259,11 @@ impl Commander {
         let pane = v_flex()
             .relative()
             .flex_none()
-            .h(px(self.terminal_height))
+            .h(px(self.terminal_height.min(half).max(80.)))
             .border_1()
             .border_color(cx.theme().border)
             .on_drag_move(cx.listener(|this, event: &DragMoveEvent<TerminalDrag>, window, cx| {
-                let most = f32::from(window.viewport_size().height) - 160.;
+                let most = f32::from(window.viewport_size().height) * 0.5;
                 this.terminal_height = f32::from(event.bounds.bottom() - event.event.position.y).clamp(80., most.max(80.));
                 cx.notify();
             }))
