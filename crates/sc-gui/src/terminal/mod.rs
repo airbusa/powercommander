@@ -22,13 +22,14 @@ use alacritty_terminal::vte::ansi::{Color, CursorShape, NamedColor, Rgb};
 use futures::StreamExt as _;
 use futures::channel::mpsc::{UnboundedSender, unbounded};
 use gpui_kit::component::ActiveTheme;
+use gpui_kit::component::menu::ContextMenuExt;
 use gpui_kit::*;
 
 /// The shell has ended.
 pub struct Exited;
 
 
-actions!(terminal, [SendTab, SendBackTab, Interrupt, CopySelection, NewTerminalTab, CloseTerminalTab, NextTerminalTab, PreviousTerminalTab]);
+actions!(terminal, [SendTab, SendBackTab, Interrupt, CopySelection, Paste, NewTerminalTab, CloseTerminalTab, NextTerminalTab, PreviousTerminalTab]);
 
 /// The terminal's own tab keys, Konsole's and GNOME Terminal's (Terminal.app's on macOS).
 #[cfg(not(target_os = "macos"))]
@@ -39,7 +40,7 @@ const TAB_KEYS: [&str; 4] = ["cmd-t", "cmd-w", "cmd-shift-]", "cmd-shift-["];
 /// Keys the terminal keeps, whatever the app's commands are bound to.
 pub fn own_key(key: &str) -> bool {
     let key = key.replace("secondary-", if cfg!(target_os = "macos") { "cmd-" } else { "ctrl-" });
-    TAB_KEYS.contains(&key.as_str()) || ["tab", "shift-tab", "ctrl-c", "cmd-c"].contains(&key.as_str())
+    TAB_KEYS.contains(&key.as_str()) || ["tab", "shift-tab", "ctrl-c", "cmd-c", "ctrl-shift-c", "ctrl-shift-v", "cmd-v", "ctrl-insert", "shift-insert"].contains(&key.as_str())
 }
 
 /// Keys GPUI Kit's root takes (Tab moves the focus, Ctrl+C copies) go to the shell here.
@@ -51,8 +52,20 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("shift-tab", SendBackTab, context),
         #[cfg(not(target_os = "macos"))]
         KeyBinding::new("ctrl-c", Interrupt, context),
+        // A terminal's copy and paste keys; the last of each is the one the right-click menu shows.
+        KeyBinding::new("ctrl-insert", CopySelection, context),
+        KeyBinding::new("shift-insert", Paste, context),
+        #[cfg(not(target_os = "macos"))]
+        KeyBinding::new("ctrl-shift-c", CopySelection, context),
+        #[cfg(not(target_os = "macos"))]
+        KeyBinding::new("ctrl-shift-v", Paste, context),
+        // Windows Terminal's (Ctrl+C copies what is selected: `interrupt`).
+        #[cfg(windows)]
+        KeyBinding::new("ctrl-v", Paste, context),
         #[cfg(target_os = "macos")]
         KeyBinding::new("cmd-c", CopySelection, context),
+        #[cfg(target_os = "macos")]
+        KeyBinding::new("cmd-v", Paste, context),
         KeyBinding::new(new, NewTerminalTab, context),
         KeyBinding::new(close, CloseTerminalTab, context),
         KeyBinding::new(next, NextTerminalTab, context),
@@ -295,6 +308,12 @@ impl TerminalView {
         }
     }
 
+    fn paste_clipboard(&mut self, cx: &mut App) {
+        if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
+            self.paste(&text);
+        }
+    }
+
     fn paste(&mut self, text: &str) {
         let text = match self.mode().contains(TermMode::BRACKETED_PASTE) {
             true => format!("\x1b[200~{}\x1b[201~", text.replace('\x1b', "")),
@@ -306,26 +325,7 @@ impl TerminalView {
     fn key_down(&mut self, event: &KeyDownEvent, _: &mut Window, cx: &mut Context<Self>) {
         let keystroke = &event.keystroke;
         let (key, held) = (keystroke.key.to_ascii_lowercase(), keystroke.modifiers);
-        // A terminal's own keys: Ctrl+Shift+C and V (⌘C and ⌘V on macOS), Shift+Insert, Shift+PageUp.
-        let own = match cfg!(target_os = "macos") {
-            true => held.platform && !held.control && !held.alt,
-            false => held.control && held.shift && !held.alt,
-        };
-        // Windows Terminal's: Ctrl+V pastes (and Ctrl+C copies what is selected: `interrupt`).
-        let windows = cfg!(windows) && held.control && !held.shift && !held.alt;
         match key.as_str() {
-            "c" if own => self.copy(cx),
-            "insert" if held.control && !held.shift => self.copy(cx),
-            "v" if own || windows => {
-                if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
-                    self.paste(&text);
-                }
-            }
-            "insert" if held.shift && !held.control => {
-                if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
-                    self.paste(&text);
-                }
-            }
             "pageup" | "pagedown" if held.shift && !self.mode().contains(TermMode::ALT_SCREEN) => {
                 self.term.lock().scroll_display(if key == "pageup" { Scroll::PageUp } else { Scroll::PageDown });
                 cx.notify();
@@ -370,6 +370,17 @@ impl TerminalView {
                 true
             }
             None => false,
+        }
+    }
+
+    /// Reported to a program that takes the mouse (mc, htop), the menu does not open.
+    fn right_down(&mut self, event: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if event.button != MouseButton::Right {
+            return;
+        }
+        window.focus(&self.focus, cx);
+        if self.report(mouse::Event::Button(event.button, true), event.position, event.modifiers) {
+            cx.stop_propagation();
         }
     }
 
@@ -547,6 +558,8 @@ fn prepaint(view: &Entity<TerminalView>, bounds: Bounds<Pixels>, window: &mut Wi
     };
     view.update(cx, |view, _| view.place(bounds.origin, cell, cells, (fore, back, dark)));
     let term = view.read(cx).term.clone();
+    // The window's own focus: a tab switched to has its focus-in heard only later.
+    let focused = view.read(cx).focus.is_focused(window);
     let term = term.lock();
     let content = term.renderable_content();
     let set = content.colors;
@@ -570,7 +583,7 @@ fn prepaint(view: &Entity<TerminalView>, bounds: Bounds<Pixels>, window: &mut Wi
     };
     let at = |line: usize, column: usize| point(bounds.origin.x + cell.width * column as f32, bounds.origin.y + cell.height * line as f32);
     let offset = content.display_offset as i32;
-    let mut layout = Layout { rects: Vec::new(), lines: Vec::new(), cursor: None, cursor_color: fore, line_height: cell.height, focused: term.is_focused };
+    let mut layout = Layout { rects: Vec::new(), lines: Vec::new(), cursor: None, cursor_color: fore, line_height: cell.height, focused };
     let mut runs: Vec<Run> = Vec::new();
     for indexed in content.display_iter {
         let Ok(line) = usize::try_from(indexed.point.line.0 + offset) else {
@@ -649,7 +662,7 @@ fn prepaint(view: &Entity<TerminalView>, bounds: Bounds<Pixels>, window: &mut Wi
         let wide = if under.flags.contains(Flags::WIDE_CHAR) { 2. } else { 1. };
         let bounds = Bounds::new(at(line, cursor.point.column.0), size(cell.width * wide, cell.height));
         // On a block, the character under it in the background's colour.
-        let under = (cursor.shape == CursorShape::Block && term.is_focused && under.c != ' ').then(|| {
+        let under = (cursor.shape == CursorShape::Block && focused && under.c != ' ').then(|| {
             let run = TextRun { len: under.c.len_utf8(), font: base.clone(), color: back, background_color: None, underline: None, strikethrough: None };
             text.shape_line(under.c.to_string().into(), font_size, &[run], Some(cell.width))
         });
@@ -691,7 +704,7 @@ fn paint(layout: Layout, view: Entity<TerminalView>, focus: &FocusHandle, window
 impl Render for TerminalView {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let (view, focus) = (cx.entity(), self.focus.clone());
-        let painted = view.clone();
+        let (painted, menu_view, menu_focus) = (view.clone(), view.downgrade(), focus.clone());
         div()
             .id("terminal")
             .key_context("Terminal")
@@ -704,9 +717,10 @@ impl Render for TerminalView {
             .on_action(cx.listener(|this, _: &SendBackTab, _, _| this.input(b"\x1b[Z".to_vec())))
             .on_action(cx.listener(Self::interrupt))
             .on_action(cx.listener(|this, _: &CopySelection, _, cx| this.copy(cx)))
+            .on_action(cx.listener(|this, _: &Paste, _, cx| this.paste_clipboard(cx)))
             .on_mouse_down(MouseButton::Left, cx.listener(Self::mouse_down))
             .on_mouse_down(MouseButton::Middle, cx.listener(Self::mouse_down))
-            .on_mouse_down(MouseButton::Right, cx.listener(Self::mouse_down))
+            .capture_any_mouse_down(cx.listener(Self::right_down))
             .on_mouse_up(MouseButton::Left, cx.listener(Self::mouse_up))
             .on_mouse_up(MouseButton::Middle, cx.listener(Self::mouse_up))
             .on_mouse_up(MouseButton::Right, cx.listener(Self::mouse_up))
@@ -716,6 +730,12 @@ impl Render for TerminalView {
                 canvas(move |bounds, window, cx| prepaint(&view, bounds, window, cx), move |_, layout, window, cx| paint(layout, painted, &focus, window, cx))
                     .size_full(),
             )
+            .context_menu(move |menu, _, cx| {
+                let selected = menu_view.read_with(cx, |this, _| this.term.lock().selection.as_ref().is_some_and(|selection| !selection.is_empty()));
+                menu.action_context(menu_focus.clone())
+                    .menu_with_disabled("Copy", Box::new(CopySelection), !selected.unwrap_or(false))
+                    .menu("Paste", Box::new(Paste))
+            })
     }
 }
 

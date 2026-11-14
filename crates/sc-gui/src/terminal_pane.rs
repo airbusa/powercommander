@@ -34,9 +34,24 @@ impl TerminalTab {
 /// The terminal's top edge, dragged.
 pub(crate) struct TerminalDrag;
 
+/// The panels keep this much of the window, however high the terminal is dragged.
+const PANELS_LEFT: f32 = 300.;
+
+fn viewport_height(window: &Window) -> f32 {
+    f32::from(window.viewport_size().height)
+}
+
 impl Commander {
     fn terminal_tab(&self) -> Option<&TerminalTab> {
         self.terminals.get(self.terminal_tab)
+    }
+
+    /// Shown again at most half the window high; dragged, it may be higher.
+    fn show_terminal(&mut self, window: &Window) {
+        if !self.terminal_shown {
+            self.terminal_height = self.terminal_height.min((viewport_height(window) * 0.5).max(80.));
+        }
+        self.terminal_shown = true;
     }
 
     /// After a menu that ran the command has given the focus back to where it was.
@@ -60,7 +75,7 @@ impl Commander {
                 self.focus_later(self.focus.clone(), window, cx);
             }
             Some(focus) => {
-                self.terminal_shown = true;
+                self.show_terminal(window);
                 self.focus_later(focus, window, cx);
             }
             None => return self.new_terminal_tab(window, cx),
@@ -97,7 +112,7 @@ impl Commander {
                 self.focus_later(view.read(cx).focus.clone(), window, cx);
                 self.terminals.push(TerminalTab { view, dir, program, _ended: ended });
                 self.terminal_tab = self.terminals.len() - 1;
-                self.terminal_shown = true;
+                self.show_terminal(window);
             }
             Err(err) => window.push_notification(Notification::error(format!("Could not start the shell: {err}")), cx),
         }
@@ -160,6 +175,12 @@ impl Commander {
                 false
             })
         });
+    }
+
+    /// The next tab, or the previous one, round.
+    fn step_terminal_tab(&mut self, next: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let count = self.terminals.len().max(1);
+        self.select_terminal_tab((self.terminal_tab + if next { 1 } else { count - 1 }) % count, window, cx);
     }
 
     fn select_terminal_tab(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
@@ -241,10 +262,10 @@ impl Commander {
             .on_click(cx.listener(|this, ix: &usize, window, cx| this.select_terminal_tab(*ix, window, cx)))
     }
 
-    /// The terminal under the panels, its top edge dragged for its height.
-    /// At most half the window high, its height kept for when the window grows again.
+    /// The terminal under the panels, its top edge dragged for its height;
+    /// its height kept for when the window grows again.
     pub(crate) fn render_terminal(&self, window: &Window, cx: &mut Context<Self>) -> Option<impl IntoElement + use<>> {
-        let half = f32::from(window.viewport_size().height) * 0.5;
+        let most = (viewport_height(window) - PANELS_LEFT).max(80.);
         let tab = self.terminal_tab().filter(|_| self.terminal_shown)?;
         let edge = div()
             .id("terminal-edge")
@@ -259,24 +280,18 @@ impl Commander {
         let pane = v_flex()
             .relative()
             .flex_none()
-            .h(px(self.terminal_height.min(half).max(80.)))
+            .h(px(self.terminal_height.clamp(80., most)))
             .border_1()
             .border_color(cx.theme().border)
             .on_drag_move(cx.listener(|this, event: &DragMoveEvent<TerminalDrag>, window, cx| {
-                let most = f32::from(window.viewport_size().height) * 0.5;
+                let most = viewport_height(window) - PANELS_LEFT;
                 this.terminal_height = f32::from(event.bounds.bottom() - event.event.position.y).clamp(80., most.max(80.));
                 cx.notify();
             }))
             .on_action(cx.listener(|this, _: &terminal::NewTerminalTab, window, cx| this.new_terminal_tab(window, cx)))
             .on_action(cx.listener(|this, _: &terminal::CloseTerminalTab, window, cx| this.confirm_close_terminal_tab(this.terminal_tab, window, cx)))
-            .on_action(cx.listener(|this, _: &terminal::NextTerminalTab, window, cx| {
-                let next = (this.terminal_tab + 1) % this.terminals.len().max(1);
-                this.select_terminal_tab(next, window, cx);
-            }))
-            .on_action(cx.listener(|this, _: &terminal::PreviousTerminalTab, window, cx| {
-                let count = this.terminals.len().max(1);
-                this.select_terminal_tab((this.terminal_tab + count - 1) % count, window, cx);
-            }))
+            .on_action(cx.listener(|this, _: &terminal::NextTerminalTab, window, cx| this.step_terminal_tab(true, window, cx)))
+            .on_action(cx.listener(|this, _: &terminal::PreviousTerminalTab, window, cx| this.step_terminal_tab(false, window, cx)))
             .on_action(cx.listener(|this, Run(command): &Run, window, cx| {
                 if *command == Command::TerminalPanel {
                     return this.toggle_terminal(window, cx);

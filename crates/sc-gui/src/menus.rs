@@ -60,15 +60,24 @@ pub fn bind(keys: &KeySettings, before: Option<&KeySettings>, cx: &mut App) {
         let context = Some(Rc::new(KeyBindingContextPredicate::parse(context).unwrap()));
         KeyBinding::load(key, action, context, false, None, &DummyKeyboardMapper).ok()
     };
-    // The terminal takes every other key, and keeps its own (Ctrl+Shift+T opens a tab there).
-    let contexts = |command: Command, key: &str| match command {
-        Command::TerminalPanel if !crate::terminal::own_key(key) => &[crate::CONTEXT, "Terminal"][..],
-        _ => &[crate::CONTEXT][..],
+    // The terminal takes every other key, and keeps its own (Ctrl+Shift+T opens a tab there);
+    // the terminal's key hides it there, the tab keys go round its tabs.
+    let targets = |command: Command, key: &str| {
+        let mut targets: Vec<(&str, Box<dyn Action>)> = vec![(crate::CONTEXT, Box::new(Run(command)))];
+        let terminal: Option<Box<dyn Action>> = match command {
+            _ if crate::terminal::own_key(key) => None,
+            Command::TerminalPanel => Some(Box::new(Run(command))),
+            Command::NextTab => Some(Box::new(crate::terminal::NextTerminalTab)),
+            Command::PreviousTab => Some(Box::new(crate::terminal::PreviousTerminalTab)),
+            _ => None,
+        };
+        targets.extend(terminal.map(|action| ("Terminal", action)));
+        targets
     };
     let mut unbind = Vec::new();
     for (key, command) in before.into_iter().flat_map(KeySettings::bindings) {
-        for context in contexts(command, &key) {
-            unbind.extend(binding(&key, Box::new(Unbind(Run::name_for_type().into())), context));
+        for (context, action) in targets(command, &key) {
+            unbind.extend(binding(&key, Box::new(Unbind(action.name().into())), context));
         }
     }
     cx.bind_keys(unbind);
@@ -83,8 +92,8 @@ pub fn bind(keys: &KeySettings, before: Option<&KeySettings>, cx: &mut App) {
     }
     let mut bindings = Vec::new();
     for (key, command) in bound {
-        for context in contexts(command, &key) {
-            bindings.extend(binding(&key, Box::new(Run(command)), context));
+        for (context, action) in targets(command, &key) {
+            bindings.extend(binding(&key, action, context));
         }
     }
     cx.bind_keys(bindings);
