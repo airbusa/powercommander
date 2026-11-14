@@ -49,9 +49,9 @@ struct Unavailable;
 #[cfg(target_os = "macos")]
 actions!(sc, [HideApp, HideOtherApps, ShowAllApps, MinimizeWindow, ZoomWindow]);
 
-/// macOS: the application menu has these, not the window's menus.
+/// macOS: the application menu has these, not the window's menus; Configuration, left empty, goes.
 #[cfg(target_os = "macos")]
-const IN_APP_MENU: [Command; 3] = [Command::About, Command::Settings, Command::Quit];
+const IN_APP_MENU: [Command; 4] = [Command::About, Command::Settings, Command::Shortcuts, Command::Quit];
 
 /// The commands' keys. Keys bound `before` are unbound first: the new
 /// bindings come after that, so they win.
@@ -215,8 +215,8 @@ pub fn set(chosen: Appearance, checked: &dyn Fn(Command) -> bool, cx: &mut App) 
 
 /// The main window's menus; `checked` commands show a check mark.
 pub fn main_menus(chosen: Appearance, checked: &dyn Fn(Command) -> bool) -> Vec<Menu> {
-    let menus = MENUS.iter();
-    menus.map(|menu| Menu::new(menu.label).items(items(menu.items, chosen, checked))).collect()
+    let menus = MENUS.iter().map(|menu| Menu::new(menu.label).items(items(menu.items, chosen, checked)));
+    menus.filter(|menu| !menu.items.is_empty()).collect()
 }
 
 fn items(list: &[Item], chosen: Appearance, checked: &dyn Fn(Command) -> bool) -> Vec<MenuItem> {
@@ -353,6 +353,7 @@ pub fn show(window: &Window, menus: Vec<Menu>, cx: &mut App) {
         item("About Spark Commander".into(), false, Box::new(Run(Command::About)), false),
         MenuItem::separator(),
         item("Settings...".into(), false, Box::new(Run(Command::Settings)), false),
+        item("Shortcuts...".into(), false, Box::new(Run(Command::Shortcuts)), false),
         MenuItem::separator(),
         MenuItem::os_submenu("Services", SystemMenuType::Services),
         MenuItem::separator(),
